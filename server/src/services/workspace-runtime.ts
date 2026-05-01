@@ -463,6 +463,7 @@ async function executeProcess(input: {
   env?: NodeJS.ProcessEnv;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
+  shell?: boolean;
 }): Promise<{
   stdout: string;
   stderr: string;
@@ -481,6 +482,7 @@ async function executeProcess(input: {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: input.env ?? process.env,
+      shell: input.shell ?? false,
     });
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
@@ -743,12 +745,12 @@ async function runWorkspaceCommand(input: {
   env: NodeJS.ProcessEnv;
   label: string;
 }) {
-  const shell = resolveShell();
   const proc = await executeProcess({
-    command: shell,
-    args: ["-c", input.resolvedCommand ?? input.command],
+    command: input.resolvedCommand ?? input.command,
+    args: [],
     cwd: input.cwd,
     env: input.env,
+    shell: true,
   });
   if (proc.code === 0) return;
 
@@ -849,12 +851,12 @@ async function recordWorkspaceCommandOperation(
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
-      const shell = resolveShell();
       const result = await executeProcess({
-        command: shell,
-        args: ["-c", input.resolvedCommand ?? input.command],
+        command: input.resolvedCommand ?? input.command,
+        args: [],
         cwd: input.cwd,
         env: input.env,
+        shell: true,
       });
       stdout = result.stdout;
       stderr = result.stderr;
