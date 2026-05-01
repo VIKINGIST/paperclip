@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, ilike, inArray, isNull, like, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, ilike, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -1319,12 +1319,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
+  // Discriminated outcome so callers can distinguish "no recovery owner found"
+  // from each gate-suppression reason and report the truth to the board (PR #4944
+  // greptile review: previously the no-owner comment was emitted for ALL null
+  // returns, which was misleading when a gate fired upstream).
+  type StrandedIssueRecoverySkipReason =
+    | "nested_recovery"
+    | "inert_status"
+    | "recent_sibling"
+    | "ops_escalation"
+    | "no_owner";
+  type StrandedIssueRecoveryOutcome = {
+    recovery: typeof issues.$inferSelect | null;
+    skipReason: StrandedIssueRecoverySkipReason | null;
+  };
+
   async function ensureStrandedIssueRecoveryIssue(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     previousStatus: "todo" | "in_progress";
-  }) {
-    if (isStrandedIssueRecoveryIssue(input.issue)) return null;
+  }): Promise<StrandedIssueRecoveryOutcome> {
+    if (isStrandedIssueRecoveryIssue(input.issue)) {
+      return { recovery: null, skipReason: "nested_recovery" };
+    }
 
     // ELE-30/ELE-32: re-fetch source status from DB to guard against the
     // PATCH/scan race (memory 10f05083). Inert statuses abort recovery creation.
@@ -1340,13 +1357,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         { event: "recovery.skipped_due_to_source_status", sourceIssueId: input.issue.id, sourceStatus, reason: "source_status_inert" },
         "recovery.skipped_due_to_source_status"
       );
-      return null;
+      return { recovery: null, skipReason: "inert_status" };
     }
 
-    // ELE-36 condition 2: debounce races — skip if any recovery for this source was created in the last 5 min
+    // ELE-36 condition 2: debounce races — skip if any recovery for this source was created in the last 5 min.
+    // We select the full sibling row (not just id) so loser callers in an 8-way
+    // race can return the winner's recovery and let the caller link the source
+    // to it via blockedByIssueIds — equivalent to the pre-iter-2 race-conflict
+    // catch-block path. Without this, concurrent reconcileStrandedAssignedIssues
+    // calls would have the gate-skipping callers overwrite the winner's linkage
+    // with []. (Regression caught by the
+    // "reuses the raced stranded recovery issue" integration test.)
     const SIBLING_TIME_WINDOW_MS = 5 * 60_000;
     const [recentSibling] = await db
-      .select({ id: issues.id })
+      .select()
       .from(issues)
       .where(
         and(
@@ -1362,7 +1386,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         { event: "recovery.skipped_due_to_recent_sibling", sourceIssueId: input.issue.id, siblingId: recentSibling.id },
         "recovery.skipped_due_to_recent_sibling"
       );
-      return null;
+      return { recovery: recentSibling, skipReason: "recent_sibling" };
     }
 
     // ELE-36 condition 3: respect manual ops escalation — skip if an open [FOR OPS] issue mentions this source
@@ -1373,7 +1397,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .where(
           and(
             eq(issues.companyId, input.issue.companyId),
-            like(issues.title, "[FOR OPS]%"),
+            ilike(issues.title, "[FOR OPS]%"),
             notInArray(issues.status, ["done", "cancelled"]),
             ilike(issues.description, `%${input.issue.identifier}%`),
           ),
@@ -1384,15 +1408,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           { event: "recovery.skipped_due_to_ops_escalation", sourceIssueId: input.issue.id, opsIssueId: opsActive.id },
           "recovery.skipped_due_to_ops_escalation"
         );
-        return null;
+        return { recovery: null, skipReason: "ops_escalation" };
       }
     }
 
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
-    if (existing) return existing;
+    if (existing) return { recovery: existing, skipReason: null };
 
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
-    if (!ownerAgentId) return null;
+    if (!ownerAgentId) return { recovery: null, skipReason: "no_owner" };
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
     let recovery: Awaited<ReturnType<typeof issuesSvc.create>>;
@@ -1427,7 +1451,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!isUniqueStrandedIssueRecoveryConflict(error)) throw error;
       const raced = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
       if (!raced) throw error;
-      return raced;
+      return { recovery: raced, skipReason: null };
     }
 
     await deps.enqueueWakeup(ownerAgentId, {
@@ -1451,7 +1475,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     });
 
-    return recovery;
+    return { recovery, skipReason: null };
   }
 
   function buildRecoveryIssueInPlaceEscalationComment(input: {
@@ -1576,7 +1600,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
-    const recoveryIssue = await ensureStrandedIssueRecoveryIssue({
+    const { recovery: recoveryIssue, skipReason } = await ensureStrandedIssueRecoveryIssue({
       issue: input.issue,
       previousStatus: input.previousStatus,
       latestRun: input.latestRun,
@@ -1592,17 +1616,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
-    const recoveryLine = recoveryIssue
-      ? [
-        "",
-        `- Recovery issue: ${issueUiLink({ identifier: recoveryIssue.identifier, id: recoveryIssue.id }, prefix)}`,
-        "- Next action: the recovery owner should either restore a live execution path or record the manual resolution, then mark the recovery issue done.",
-      ].join("\n")
-      : [
-        "",
-        "- Recovery issue: none created because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
-        "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
-      ].join("\n");
+    const recoveryLine = (() => {
+      if (recoveryIssue) {
+        return [
+          "",
+          `- Recovery issue: ${issueUiLink({ identifier: recoveryIssue.identifier, id: recoveryIssue.id }, prefix)}`,
+          "- Next action: the recovery owner should either restore a live execution path or record the manual resolution, then mark the recovery issue done.",
+        ].join("\n");
+      }
+      // PR #4944 greptile review: report the actual gate-suppression reason instead
+      // of always claiming no owner was found.
+      switch (skipReason) {
+        case "inert_status":
+          return [
+            "",
+            "- Recovery issue: none created because the source is already in an inert status (`blocked`, `cancelled`, or `done`) — Paperclip respects the manual-review state.",
+            "- Next action: if the source needs another attempt, move it back to `todo` and the recovery scheduler will reconsider on the next failure.",
+          ].join("\n");
+        case "recent_sibling":
+          return [
+            "",
+            "- Recovery issue: none created because another recovery for this source was already created in the last 5 minutes — duplicate suppressed by the sibling-time-window gate.",
+            "- Next action: let the existing recovery issue run to completion; if it also stalls, the next failure outside the 5-min window will spawn a fresh recovery.",
+          ].join("\n");
+        case "ops_escalation":
+          return [
+            "",
+            "- Recovery issue: none created because an open `[FOR OPS]` issue already references this source — the human ops track owns the structural fix.",
+            "- Next action: track progress on the `[FOR OPS]` issue; the recovery scheduler will resume once that issue is closed (`done` or `cancelled`).",
+          ].join("\n");
+        case "nested_recovery":
+          // Defensive: escalateStrandedAssignedIssue routes nested recovery issues
+          // to escalateStrandedRecoveryIssueInPlace earlier; reaching here means
+          // the routing changed. Surface the unexpected state explicitly.
+          return [
+            "",
+            "- Recovery issue: none created because the source is itself a recovery issue; nested recovery is not supported.",
+            "- Next action: a board operator should triage this recovery issue directly.",
+          ].join("\n");
+        case "no_owner":
+        default:
+          return [
+            "",
+            "- Recovery issue: none created because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
+            "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+          ].join("\n");
+      }
+    })();
 
     await issuesSvc.addComment(input.issue.id, `${input.comment}${recoveryLine}`, {});
 
