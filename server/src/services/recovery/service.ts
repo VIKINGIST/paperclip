@@ -1326,6 +1326,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
+    // ELE-30: skip recovery creation when the source has been manually parked
+    // or closed. Otherwise auto-recovery loops on blocked/cancelled sources.
+    // See memory hash 6312ae17 for full reasoning.
+    const STRANDED_RECOVERY_INERT_STATUSES = new Set(["blocked", "cancelled", "done"]);
+    if (STRANDED_RECOVERY_INERT_STATUSES.has(input.issue.status)) {
+      return null;
+    }
+
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
 
