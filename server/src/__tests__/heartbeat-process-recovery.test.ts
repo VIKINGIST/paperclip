@@ -1940,6 +1940,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // The re-fetch is uniquely identified by db.select({ id, status }) — exactly 2 keys.
     // This simulates the race condition where the source issue transitions to
     // blocked between the candidates scan and recovery creation (memory 10f05083).
+    //
+    // PR #4944 greptile review (P2): this column-shape spy is brittle — any
+    // future query in reconcileStrandedAssignedIssues that selects exactly
+    // { id, status } will be silently hijacked. The narrow keys-equality check
+    // (sort + join + exact match "id,status") is a deliberate guard, but a
+    // safer approach for future tests is the embedded-Postgres fixture used by
+    // sibling tests in this file. Kept here because the alternative requires
+    // standing up a fixture for a single negative-path assertion. If the
+    // implementation grows another `select({ id, status })` call upstream of
+    // the re-fetch, this test will need to disambiguate by argument list or
+    // call order. TODO: track follow-up if the re-fetch is moved or duplicated.
     const originalSelect = (db.select as (...args: unknown[]) => unknown).bind(db);
     const selectSpy = vi.spyOn(db, "select").mockImplementation((columns?: unknown) => {
       if (
