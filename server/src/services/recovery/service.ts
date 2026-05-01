@@ -1326,11 +1326,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
-    // ELE-30: skip recovery creation when the source has been manually parked
-    // or closed. Otherwise auto-recovery loops on blocked/cancelled sources.
-    // See memory hash 6312ae17 for full reasoning.
+    // ELE-30/ELE-32: re-fetch source status from DB to guard against the
+    // PATCH/scan race (memory 10f05083). Inert statuses abort recovery creation.
     const STRANDED_RECOVERY_INERT_STATUSES = new Set(["blocked", "cancelled", "done"]);
-    if (STRANDED_RECOVERY_INERT_STATUSES.has(input.issue.status)) {
+    const [freshSource] = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+      .limit(1);
+    const sourceStatus = freshSource?.status ?? input.issue.status;
+    if (STRANDED_RECOVERY_INERT_STATUSES.has(sourceStatus)) {
+      logger.info(
+        { event: "recovery.skipped_due_to_source_status", sourceIssueId: input.issue.id, sourceStatus, reason: "source_status_inert" },
+        "recovery.skipped_due_to_source_status"
+      );
       return null;
     }
 
