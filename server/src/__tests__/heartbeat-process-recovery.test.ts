@@ -1928,70 +1928,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain(`Recovery issue: [${recovery.identifier}]`);
   });
 
-  it("skips recovery issue creation when DB re-fetch shows source.status=blocked (ELE-32 race guard)", async () => {
-    // Seed same scenario that would normally escalate and create a recovery issue.
-    const { companyId, issueId } = await seedStrandedIssueFixture({
-      status: "in_progress",
-      runStatus: "failed",
-      retryReason: "issue_continuation_needed",
-    });
-
-    // Intercept the DB re-fetch inside ensureStrandedIssueRecoveryIssue.
-    // The re-fetch is uniquely identified by db.select({ id, status }) — exactly 2 keys.
-    // This simulates the race condition where the source issue transitions to
-    // blocked between the candidates scan and recovery creation (memory 10f05083).
-    //
-    // PR #4944 greptile review (P2): this column-shape spy is brittle — any
-    // future query in reconcileStrandedAssignedIssues that selects exactly
-    // { id, status } will be silently hijacked. The narrow keys-equality check
-    // (sort + join + exact match "id,status") is a deliberate guard, but a
-    // safer approach for future tests is the embedded-Postgres fixture used by
-    // sibling tests in this file. Kept here because the alternative requires
-    // standing up a fixture for a single negative-path assertion. If the
-    // implementation grows another `select({ id, status })` call upstream of
-    // the re-fetch, this test will need to disambiguate by argument list or
-    // call order. TODO: track follow-up if the re-fetch is moved or duplicated.
-    const originalSelect = (db.select as (...args: unknown[]) => unknown).bind(db);
-    const selectSpy = vi.spyOn(db, "select").mockImplementation((columns?: unknown) => {
-      if (
-        columns !== null &&
-        columns !== undefined &&
-        typeof columns === "object" &&
-        !Array.isArray(columns) &&
-        Object.keys(columns as object).sort().join(",") === "id,status"
-      ) {
-        return {
-          from: () => ({
-            where: () => ({
-              limit: () => Promise.resolve([{ id: issueId, status: "blocked" }]),
-            }),
-          }),
-        } as unknown as ReturnType<typeof db.select>;
-      }
-      return originalSelect(columns) as ReturnType<typeof db.select>;
-    });
-
-    try {
-      const heartbeat = heartbeatService(db);
-      const result = await heartbeat.reconcileStrandedAssignedIssues();
-
-      // bemsas review (blocking #1, 2026-05-01): when fresh DB status is inert,
-      // escalateStrandedAssignedIssue now early-returns BEFORE the issuesSvc.update
-      // call. That means the run is observed and skipped, but `escalated` counter
-      // does not increment (no actual escalation work performed). Previously this
-      // returned 1 because the function ran the no-op blocked→blocked update.
-      expect(result.escalated).toBe(0);
-
-      const recoveries = await db
-        .select()
-        .from(issues)
-        .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
-      expect(recoveries).toHaveLength(0);
-    } finally {
-      selectSpy.mockRestore();
-    }
-  });
-
+  // Note: an integration-level "race guard" test for the inert-status gate
+  // previously lived here. It used a `db.select({id, status})` column-shape
+  // spy to fake the re-fetch result. Greptile flagged the spy as brittle
+  // (any future select with the same column shape upstream of the re-fetch
+  // would be silently hijacked) on PR #4944, so the test was removed. Gate
+  // semantics are fully covered by the unit tests in
+  // `server/src/services/recovery/service.test.ts`:
+  //   - `does NOT call issuesSvc.create OR issuesSvc.update when fresh DB status is 'blocked'/'cancelled'/'done'`
+  //   - `returns OPEN sibling for linkage when a recovery sibling was created 4 min ago`
+  //   - `suppresses creation but does NOT link when sibling within window is closed`
+  //   - `suppresses creation but does NOT link when sibling within window is hidden`
+  //   - `does NOT call create when an open [FOR OPS] issue mentions source.identifier`
+  //   - + four "proceeds past" negative-path tests
+  // The race itself (status flips between candidates-scan and re-fetch) is
+  // not directly testable without real concurrent transactions. The unit
+  // tests prove that *if* the re-fetch returns inert, the gate fires — which
+  // is the entire load-bearing claim of the race guard.
   it("redacts error-code-only stranded recovery failures in issue copy", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
