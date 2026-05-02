@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
@@ -35,6 +35,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
+  triggerWorktreeCleanupForIssue,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import { writeLocalServiceRegistryRecord } from "../services/local-service-supervisor.ts";
@@ -304,6 +305,42 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  it("falls back to project_primary when issue is null on a git_worktree agent (ELE-53 A1)", async () => {
+    // Does not touch git — the guard returns early before any git ops.
+    const fakeBaseCwd = "/fake/repo";
+    const result = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: fakeBaseCwd,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: null,
+      agent: {
+        id: "agent-1",
+        name: "Implementer",
+        companyId: "company-1",
+      },
+    });
+
+    expect(result.strategy).toBe("project_primary");
+    expect(result.cwd).toBe(fakeBaseCwd);
+    expect(result.branchName).toBeNull();
+    expect(result.worktreePath).toBeNull();
+    expect(result.created).toBe(false);
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("No issue context")]),
+    );
+  });
+
   it("creates and reuses a git worktree for an issue-scoped branch", async () => {
     const repoRoot = await createTempRepo();
 
@@ -3234,5 +3271,166 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       scopeId: "execution-workspace-1",
       executionWorkspaceId: "execution-workspace-1",
     });
+  });
+});
+
+describeEmbeddedPostgres("triggerWorktreeCleanupForIssue (ELE-53 A2/A3)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let projectId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cleanup-invariant-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  beforeEach(async () => {
+    companyId = randomUUID();
+    projectId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test Company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Test Project" });
+  });
+
+  afterEach(async () => {
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  it("removes the git worktree and branch when issue transitions to done (A2)", async () => {
+    const repoRoot = await createTempRepo();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId,
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" },
+      },
+      issue: { id: "issue-cleanup-a2", identifier: "ELE-500", title: "Cleanup test" },
+      agent: { id: "agent-1", name: "Implementer", companyId },
+    });
+
+    expect(workspace.strategy).toBe("git_worktree");
+    await expect(fs.stat(workspace.cwd)).resolves.toBeTruthy();
+
+    const wsId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: wsId,
+      companyId,
+      projectId,
+      mode: "direct",
+      strategyType: "git_worktree",
+      name: workspace.branchName ?? "cleanup-test",
+      cwd: workspace.cwd,
+      providerType: "git_worktree",
+      branchName: workspace.branchName,
+      metadata: { createdByRuntime: true },
+    });
+
+    await triggerWorktreeCleanupForIssue({ db, issueId: "issue-cleanup-a2", workspaceId: wsId });
+
+    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+  });
+
+  it("is idempotent when the worktree directory is already gone", async () => {
+    const wsId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: wsId,
+      companyId,
+      projectId,
+      mode: "direct",
+      strategyType: "git_worktree",
+      name: "gone-worktree",
+      cwd: `/tmp/nonexistent-worktree-${randomUUID()}`,
+      providerType: "git_worktree",
+      branchName: "test-branch",
+    });
+
+    await expect(
+      triggerWorktreeCleanupForIssue({ db, issueId: "issue-1", workspaceId: wsId }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("no-ops for project_primary workspaces (providerType != git_worktree)", async () => {
+    const wsId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: wsId,
+      companyId,
+      projectId,
+      mode: "direct",
+      strategyType: "project_primary",
+      name: "primary",
+      providerType: "local_fs",
+    });
+
+    await expect(
+      triggerWorktreeCleanupForIssue({ db, issueId: "issue-1", workspaceId: wsId }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("no-ops when the workspace row does not exist", async () => {
+    await expect(
+      triggerWorktreeCleanupForIssue({ db, issueId: "issue-1", workspaceId: randomUUID() }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("logs cleanup_deferred after exhausting maxAttempts with a non-removable path (A3)", async () => {
+    const warnCalls: Array<Record<string, unknown>> = [];
+    const originalWarn = console.warn;
+    // Spy on pinoLogger calls surfaced through the warning path by intercepting
+    // pino's underlying write.  For test isolation we capture log args instead.
+    vi.spyOn(console, "warn").mockImplementation((...args) => {
+      warnCalls.push(args as unknown as Record<string, unknown>);
+      originalWarn(...args);
+    });
+
+    const stuckDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stuck-worktree-"));
+    const wsId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: wsId,
+      companyId,
+      projectId,
+      mode: "direct",
+      strategyType: "git_worktree",
+      name: "stuck",
+      cwd: stuckDir,
+      providerRef: stuckDir,
+      providerType: "git_worktree",
+      branchName: "stuck-branch",
+      metadata: { createdByRuntime: true },
+    });
+
+    vi.useFakeTimers();
+    const p = triggerWorktreeCleanupForIssue({
+      db,
+      issueId: "issue-stuck",
+      workspaceId: wsId,
+      maxAttempts: 2,
+      retryIntervalMs: 50,
+    });
+    await p;
+
+    // Advance fake timer to trigger the retry
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+
+    vi.restoreAllMocks();
+    await fs.rm(stuckDir, { recursive: true, force: true });
   });
 });

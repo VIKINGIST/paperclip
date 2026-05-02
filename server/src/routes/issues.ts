@@ -82,11 +82,13 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
+import { triggerWorktreeCleanupForIssue } from "../services/workspace-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  closeWithoutMerge: z.boolean().optional(),
 });
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
@@ -1951,6 +1953,7 @@ export function issueRoutes(
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      closeWithoutMerge: closeWithoutMergeRequested,
       ...updateFields
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
@@ -2054,6 +2057,19 @@ export function issueRoutes(
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
 
+    // C. Cross-repo close: synthesize an approval comment when the caller signals
+    // no local branch exists (closeWithoutMerge=true) and the issue has no worktree
+    // workspace (project_primary semantics). For worktree-based issues the normal
+    // merge flow applies even when closeWithoutMerge is sent.
+    const isCrossRepoClose =
+      closeWithoutMergeRequested === true &&
+      updateFields.status === "done" &&
+      !existing.executionWorkspaceId;
+    const effectiveCommentBody =
+      isCrossRepoClose && !commentBody
+        ? "Closed without merge (cross-repo work — commits already on main branch)."
+        : commentBody;
+
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
@@ -2067,7 +2083,7 @@ export function issueRoutes(
         agentId: actor.agentId ?? null,
         userId: actor.actorType === "user" ? actor.actorId : null,
       },
-      commentBody,
+      commentBody: effectiveCommentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
     });
     const decisionId = transition.decision ? randomUUID() : null;
@@ -2389,10 +2405,10 @@ export function issueRoutes(
     }
 
     let comment = null;
-    if (commentBody) {
+    if (effectiveCommentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      comment = await svc.addComment(id, commentBody, {
+      comment = await svc.addComment(id, effectiveCommentBody, {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
@@ -2559,7 +2575,7 @@ export function issueRoutes(
         });
       }
 
-      if (commentBody && comment) {
+      if (effectiveCommentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
@@ -2596,7 +2612,7 @@ export function issueRoutes(
 
         let mentionedIds: string[] = [];
         try {
-          mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
+          mentionedIds = await svc.findMentionedAgents(issue.companyId, effectiveCommentBody);
         } catch (err) {
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
@@ -2624,6 +2640,16 @@ export function issueRoutes(
 
       const becameDone = existing.status !== "done" && issue.status === "done";
       if (becameDone) {
+        if (existing.executionWorkspaceId) {
+          triggerWorktreeCleanupForIssue({
+            db,
+            issueId: issue.id,
+            workspaceId: existing.executionWorkspaceId,
+          }).catch((err) =>
+            logger.warn({ err, issueId: issue.id }, "failed to initiate worktree cleanup on issue done"),
+          );
+        }
+
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
           addWakeup(dependent.assigneeAgentId, {

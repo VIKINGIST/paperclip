@@ -3,6 +3,20 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+const WORKSPACE_ID = "workspace-1111-1111-4111-8111-111111111111";
+
+const mockTriggerWorktreeCleanup = vi.hoisted(() => vi.fn(async () => {}));
+
+vi.mock("../services/workspace-runtime.js", () => ({
+  triggerWorktreeCleanupForIssue: mockTriggerWorktreeCleanup,
+}));
+
+vi.mock("../services/execution-workspaces.js", () => ({
+  executionWorkspaceService: () => ({
+    getById: vi.fn(async () => null),
+    update: vi.fn(async () => null),
+  }),
+}));
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -356,6 +370,60 @@ describe("issue update comment wakeups", () => {
           previousStatus: "blocked",
         }),
       }),
+    );
+  });
+
+  it("triggers triggerWorktreeCleanupForIssue on done transition with executionWorkspaceId (ELE-53 B)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+      executionWorkspaceId: WORKSPACE_ID,
+    });
+    const updated = { ...existing, status: "done" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    // Allow the fire-and-forget wakeup block to run (has at least one async tick)
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockTriggerWorktreeCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: existing.id,
+        workspaceId: WORKSPACE_ID,
+      }),
+    );
+  });
+
+  it("synthesizes approval comment and accepts done transition with closeWithoutMerge:true (ELE-53 C)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = { ...existing, status: "done" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-cross-repo",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Closed without merge (cross-repo work — commits already on main branch).",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", closeWithoutMerge: true });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      existing.id,
+      "Closed without merge (cross-repo work — commits already on main branch).",
+      expect.anything(),
     );
   });
 });

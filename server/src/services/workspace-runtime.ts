@@ -29,6 +29,7 @@ import {
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import { logger } from "../middleware/logger.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -1001,6 +1002,24 @@ export async function realizeExecutionWorkspace(input: {
     };
   }
 
+  // A. Fall back to project_primary semantics when no issue context is provided for a
+  // git_worktree agent (e.g. manual wakeup without issueId). Without this guard the
+  // resolver would generate a degenerate branch name like "issue-issue" and pick the
+  // first worktree from `git worktree list`, which is often a stale orphan branch.
+  if (!input.issue) {
+    return {
+      ...input.base,
+      strategy: "project_primary",
+      cwd: input.base.baseCwd,
+      branchName: null,
+      worktreePath: null,
+      warnings: [
+        "No issue context for git_worktree agent — falling back to project_primary workspace (no per-issue worktree created).",
+      ],
+      created: false,
+    };
+  }
+
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
   const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
   const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
@@ -1463,6 +1482,83 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     cleaned,
     warnings,
   };
+}
+
+/**
+ * B. Cleanup invariant: when an issue transitions to status=done, attempt to remove
+ * the associated git_worktree and branch. Retries up to maxAttempts times with
+ * retryIntervalMs between attempts (default: 3 attempts, 5-minute intervals).
+ * After exhausting attempts, logs a cleanup_deferred warning for fleet monitoring.
+ */
+export async function triggerWorktreeCleanupForIssue(input: {
+  db: Db;
+  issueId: string;
+  workspaceId: string;
+  maxAttempts?: number;
+  retryIntervalMs?: number;
+}): Promise<void> {
+  const { db, issueId, workspaceId, maxAttempts = 3, retryIntervalMs = 5 * 60 * 1000 } = input;
+
+  const workspaceRow = await db
+    .select()
+    .from(executionWorkspaces)
+    .where(eq(executionWorkspaces.id, workspaceId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!workspaceRow || workspaceRow.providerType !== "git_worktree") return;
+
+  const projectWorkspaceRow = workspaceRow.projectWorkspaceId
+    ? await db
+        .select({ cwd: projectWorkspaces.cwd, cleanupCommand: projectWorkspaces.cleanupCommand })
+        .from(projectWorkspaces)
+        .where(eq(projectWorkspaces.id, workspaceRow.projectWorkspaceId))
+        .then((rows) => rows[0] ?? null)
+    : null;
+
+  const workspaceInput = {
+    id: workspaceRow.id,
+    cwd: workspaceRow.cwd ?? null,
+    providerType: workspaceRow.providerType,
+    providerRef: workspaceRow.providerRef ?? null,
+    branchName: workspaceRow.branchName ?? null,
+    repoUrl: workspaceRow.repoUrl ?? null,
+    baseRef: workspaceRow.baseRef ?? null,
+    projectId: workspaceRow.projectId ?? null,
+    projectWorkspaceId: workspaceRow.projectWorkspaceId ?? null,
+    sourceIssueId: workspaceRow.sourceIssueId ?? null,
+    metadata: (workspaceRow.metadata as Record<string, unknown> | null) ?? null,
+  };
+
+  async function attempt(n: number): Promise<void> {
+    try {
+      const result = await cleanupExecutionWorkspaceArtifacts({
+        workspace: workspaceInput,
+        projectWorkspace: projectWorkspaceRow ?? null,
+      });
+      if (result.cleaned) return;
+      if (n < maxAttempts) {
+        logger.warn(
+          { issueId, workspaceId, attempt: n, warnings: result.warnings },
+          "Worktree cleanup incomplete, scheduling retry",
+        );
+        setTimeout(() => { void attempt(n + 1); }, retryIntervalMs);
+      } else {
+        logger.warn(
+          { issueId, workspaceId, warnings: result.warnings },
+          "cleanup_deferred: worktree removal incomplete after max attempts",
+        );
+      }
+    } catch (err) {
+      if (n < maxAttempts) {
+        logger.warn({ err, issueId, workspaceId, attempt: n }, "Worktree cleanup error, scheduling retry");
+        setTimeout(() => { void attempt(n + 1); }, retryIntervalMs);
+      } else {
+        logger.warn({ err, issueId, workspaceId }, "cleanup_deferred: worktree cleanup threw after max attempts");
+      }
+    }
+  }
+
+  await attempt(1);
 }
 
 async function allocatePort(): Promise<number> {
