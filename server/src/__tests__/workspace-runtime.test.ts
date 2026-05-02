@@ -3390,16 +3390,10 @@ describeEmbeddedPostgres("triggerWorktreeCleanupForIssue (ELE-53 A2/A3)", () => 
     ).resolves.toBeUndefined();
   });
 
-  it("logs cleanup_deferred after exhausting maxAttempts with a non-removable path (A3)", async () => {
-    const warnCalls: Array<Record<string, unknown>> = [];
-    const originalWarn = console.warn;
-    // Spy on pinoLogger calls surfaced through the warning path by intercepting
-    // pino's underlying write.  For test isolation we capture log args instead.
-    vi.spyOn(console, "warn").mockImplementation((...args) => {
-      warnCalls.push(args as unknown as Record<string, unknown>);
-      originalWarn(...args);
-    });
-
+  it("retries and completes without throwing when the worktree cannot be removed (A3)", async () => {
+    // Use a plain directory (not a git repo) so git worktree remove fails — the
+    // cleanup function should retry and ultimately succeed or exhaust attempts
+    // without surfacing an uncaught rejection.
     const stuckDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stuck-worktree-"));
     const wsId = randomUUID();
     await db.insert(executionWorkspaces).values({
@@ -3416,21 +3410,19 @@ describeEmbeddedPostgres("triggerWorktreeCleanupForIssue (ELE-53 A2/A3)", () => 
       metadata: { createdByRuntime: true },
     });
 
-    vi.useFakeTimers();
-    const p = triggerWorktreeCleanupForIssue({
-      db,
-      issueId: "issue-stuck",
-      workspaceId: wsId,
-      maxAttempts: 2,
-      retryIntervalMs: 50,
-    });
-    await p;
+    // Use real timers with a 1ms retry interval so the test completes quickly.
+    await expect(
+      triggerWorktreeCleanupForIssue({
+        db,
+        issueId: "issue-stuck",
+        workspaceId: wsId,
+        maxAttempts: 2,
+        retryIntervalMs: 1,
+      }),
+    ).resolves.toBeUndefined();
 
-    // Advance fake timer to trigger the retry
-    await vi.runAllTimersAsync();
-    vi.useRealTimers();
-
-    vi.restoreAllMocks();
+    // Give async retries time to complete
+    await new Promise((r) => setTimeout(r, 100));
     await fs.rm(stuckDir, { recursive: true, force: true });
-  });
+  }, 10_000);
 });
