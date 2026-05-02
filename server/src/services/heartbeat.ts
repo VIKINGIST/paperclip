@@ -1524,6 +1524,19 @@ function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot, null));
 }
 
+// An explicit blocked→todo PATCH carries previousStatus:"blocked" in the wake context.
+// The assignee should run immediately regardless of unresolved dependency blockers,
+// because the human intentionally cleared the blocked state (e.g. fixed the root cause).
+function isBlockedToTodoStatusChangeWake(
+  wakeReason: string | null | undefined,
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  return (
+    wakeReason === "issue_status_changed" &&
+    readNonEmptyString(contextSnapshot?.previousStatus) === "blocked"
+  );
+}
+
 async function listUnresolvedBlockerSummaries(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -4054,7 +4067,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context) && !isBlockedToTodoStatusChangeWake(readNonEmptyString(context.wakeReason), context)) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
         return null;
@@ -6993,7 +7006,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
 
-        if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
+        const blockedToTodoStatusChange = isBlockedToTodoStatusChangeWake(reason, enrichedContextSnapshot);
+        if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake && !blockedToTodoStatusChange) {
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,

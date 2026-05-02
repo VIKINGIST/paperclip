@@ -2543,6 +2543,7 @@ export function issueRoutes(
           payload: {
             issueId: issue.id,
             mutation: "update",
+            previousStatus: existing.status,
             ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
             ...(interruptedRunId ? { interruptedRunId } : {}),
           },
@@ -2551,6 +2552,7 @@ export function issueRoutes(
           contextSnapshot: {
             issueId: issue.id,
             source: "issue.status_change",
+            previousStatus: existing.status,
             ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
             ...(interruptedRunId ? { interruptedRunId } : {}),
           },
