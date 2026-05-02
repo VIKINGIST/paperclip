@@ -290,4 +290,72 @@ describe("issue update comment wakeups", () => {
       }),
     );
   });
+
+  it("fires issue_status_changed wake with previousStatus:blocked on single-field blocked→todo PATCH (ELE-52 A1)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    const updated = { ...existing, status: "todo" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        source: "automation",
+        reason: "issue_status_changed",
+        payload: expect.objectContaining({
+          issueId: existing.id,
+          mutation: "update",
+          previousStatus: "blocked",
+        }),
+        contextSnapshot: expect.objectContaining({
+          issueId: existing.id,
+          source: "issue.status_change",
+          previousStatus: "blocked",
+        }),
+      }),
+    );
+  });
+
+  it("fires issue_status_changed wake with previousStatus:blocked on multi-field blocked→todo PATCH (ELE-52 A2)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    const updated = { ...existing, status: "todo", title: "Shortened title for recovery" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ title: "Shortened title for recovery", status: "todo" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        source: "automation",
+        reason: "issue_status_changed",
+        payload: expect.objectContaining({
+          issueId: existing.id,
+          previousStatus: "blocked",
+        }),
+        contextSnapshot: expect.objectContaining({
+          source: "issue.status_change",
+          previousStatus: "blocked",
+        }),
+      }),
+    );
+  });
 });
