@@ -732,6 +732,118 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("includes previousStatus:blocked in contextSnapshot for single-field blocked→todo PATCH (ELE-52 A1)", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_status_changed",
+        payload: expect.objectContaining({ previousStatus: "blocked" }),
+        contextSnapshot: expect.objectContaining({
+          source: "issue.status_change",
+          previousStatus: "blocked",
+        }),
+      }),
+    ));
+  });
+
+  it("multi-field PATCH {title, status:todo} on blocked issue fires issue_status_changed wake with previousStatus:blocked (ELE-52 A2)", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ title: "Extract helper for shorter branch slug", status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        source: "automation",
+        reason: "issue_status_changed",
+        payload: expect.objectContaining({
+          issueId: "11111111-1111-4111-8111-111111111111",
+          mutation: "update",
+          previousStatus: "blocked",
+        }),
+        contextSnapshot: expect.objectContaining({
+          source: "issue.status_change",
+          previousStatus: "blocked",
+        }),
+      }),
+    ));
+  });
+
+  it("blocked→todo PATCH on issue previously in_progress fires wake with previousStatus:blocked (ELE-52 A3)", async () => {
+    // Represents the auto-recovery escalation scenario: issue was in_progress,
+    // run failed, escalation set status=blocked; CEO then PATCHes status back to todo.
+    // The route sees existing.status===blocked so previousStatus===blocked is correct.
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ title: "Shortened title for path fix", description: "Updated description", status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_status_changed",
+        contextSnapshot: expect.objectContaining({ previousStatus: "blocked" }),
+      }),
+    ));
+  });
+
+  it("backlog→todo PATCH fires issue_status_changed wake without previousStatus:blocked (ELE-52 A4 regression)", async () => {
+    const issue = makeIssue("todo");
+    const backlogIssue = { ...issue, status: "backlog" as const };
+    mockIssueService.getById.mockResolvedValue(backlogIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...backlogIssue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_status_changed",
+        contextSnapshot: expect.objectContaining({
+          source: "issue.status_change",
+          previousStatus: "backlog",
+        }),
+      }),
+    ));
+  });
+
   it("wakes the assignee when an assigned done issue moves back to todo", async () => {
     const issue = makeIssue("done");
     mockIssueService.getById.mockResolvedValue(issue);
