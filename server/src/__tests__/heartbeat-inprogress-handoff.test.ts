@@ -6,11 +6,22 @@ import {
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  budgetPolicies,
+  companySkills,
   companies,
+  costEvents,
   createDb,
+  documentRevisions,
+  documents,
+  environmentLeases,
+  environments,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueDocuments,
+  issueRelations,
+  issueTreeHoldMembers,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import { runningProcesses } from "../adapters/index.ts";
@@ -83,7 +94,7 @@ describeEmbeddedPostgres("heartbeat in-progress handoff recovery", () => {
   afterEach(async () => {
     vi.clearAllMocks();
     runningProcesses.clear();
-    // Cancel any runs still in flight so FK constraints don't block the rest of cleanup.
+    // Cancel active runs before cleanup to avoid FK violations.
     const activeRuns = await db
       .select({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId })
       .from(heartbeatRuns)
@@ -102,33 +113,74 @@ describeEmbeddedPostgres("heartbeat in-progress handoff recovery", () => {
           .where(inArray(agentWakeupRequests.id, wakeIds));
       }
     }
-    // Delete in FK-safe order.
+    // Wait for any in-flight managed executions to settle.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      const managedStillActive = runs.some(
+        (r) => r.status === "queued" || r.status === "running",
+      );
+      if (!managedStillActive) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    // Delete in FK-safe order, mirroring heartbeat-process-recovery cleanup.
     await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
+    await db.delete(agentRuntimeState);
+    await db.delete(companySkills);
+    await db.delete(costEvents);
+    await db.delete(environmentLeases);
+    await db.delete(environments);
+    await db.delete(issueComments);
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
+    await db.delete(issueRelations);
+    await db.delete(issueTreeHoldMembers);
+    await db.delete(issueTreeHolds);
     for (let attempt = 0; attempt < 5; attempt++) {
-      await db.delete(heartbeatRuns);
+      await db.delete(issueComments);
+      await db.delete(issueDocuments);
       try {
-        await db.delete(agentRuntimeState);
+        await db.delete(issues);
         break;
-      } catch {
-        if (attempt === 4) throw new Error("Failed to clean agentRuntimeState after 5 attempts");
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await db.delete(activityLog);
+      await db.delete(heartbeatRunEvents);
+      try {
+        await db.delete(heartbeatRuns);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
         await new Promise((r) => setTimeout(r, 50));
       }
     }
     await db.delete(agentWakeupRequests);
-    await db.delete(issueComments);
-    await db.delete(issues);
+    await db.delete(budgetPolicies);
     for (let attempt = 0; attempt < 5; attempt++) {
       await db.delete(agentRuntimeState);
       try {
         await db.delete(agents);
         break;
-      } catch {
-        if (attempt === 4) throw new Error("Failed to clean agents after 5 attempts");
+      } catch (error) {
+        if (attempt === 4) throw error;
         await new Promise((r) => setTimeout(r, 50));
       }
     }
-    await db.delete(companies);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await db.delete(companySkills);
+      try {
+        await db.delete(companies);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
   });
 
   afterAll(async () => {
