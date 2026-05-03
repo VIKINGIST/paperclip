@@ -587,6 +587,11 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
+async function branchExistsInGit(repoRoot: string, branchName: string): Promise<boolean> {
+  const output = await runGit(["branch", "--list", branchName], repoRoot).catch(() => "");
+  return output.trim().length > 0;
+}
+
 async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   // Try the explicit remote HEAD first (set by git clone or git remote set-head)
   try {
@@ -891,6 +896,61 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
+// In-memory loop-protection: prevent infinite retry loops when a branch requires
+// repeated stale-state cleanup (e.g. ELE-90 pattern — branch created, dir missing,
+// CEO delete silently fails, issue re-dispatched → same fail repeated).
+const _worktreeCleanupAttempts = new Map<string, { count: number; firstAt: number }>();
+const WORKTREE_CLEANUP_LOOP_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const WORKTREE_CLEANUP_LOOP_MAX = 3;
+
+function recordWorktreeCleanupAttempt(branchName: string): void {
+  const now = Date.now();
+  const entry = _worktreeCleanupAttempts.get(branchName);
+  if (!entry || now - entry.firstAt > WORKTREE_CLEANUP_LOOP_WINDOW_MS) {
+    _worktreeCleanupAttempts.set(branchName, { count: 1, firstAt: now });
+    return;
+  }
+  const newCount = entry.count + 1;
+  _worktreeCleanupAttempts.set(branchName, { count: newCount, firstAt: entry.firstAt });
+  if (newCount >= WORKTREE_CLEANUP_LOOP_MAX) {
+    throw new Error(
+      `loop_protection_triggered: branch "${branchName}" required stale-state cleanup ` +
+      `${newCount} times within 1h — manual intervention required: ` +
+      `git branch -D "${branchName}" && git worktree prune`,
+    );
+  }
+}
+
+// Layer 1 defensive cleanup: remove stale worktree half-state (branch ref exists but dir
+// missing/invalid, or dir exists but not a valid worktree) so the next git worktree add
+// starts from a clean slate.
+async function cleanupStaleWorktreeHalfState(
+  repoRoot: string,
+  branchName: string,
+  worktreePath: string,
+  reason: "stale_branch" | "orphan_dir" | "invalid_worktree",
+): Promise<void> {
+  recordWorktreeCleanupAttempt(branchName);
+  logger.warn(
+    { repoRoot, branchName, worktreePath, reason },
+    `recovery=pre_add_${reason}: cleaning up stale worktree half-state before retry`,
+  );
+  if (await directoryExists(worktreePath)) {
+    await fs.rm(worktreePath, { recursive: true, force: true });
+  }
+  await runGit(["worktree", "prune"], repoRoot).catch(() => {});
+  if (await branchExistsInGit(repoRoot, branchName)) {
+    await runGit(["branch", "-D", branchName], repoRoot).catch(() => {});
+    // Layer 3: verify deletion succeeded — silent failures here cause retry loops
+    if (await branchExistsInGit(repoRoot, branchName)) {
+      logger.error(
+        { repoRoot, branchName },
+        "verify_failed=branch_still_present_after_delete: manual cleanup required",
+      );
+    }
+  }
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -1099,8 +1159,16 @@ export async function realizeExecutionWorkspace(input: {
     if (validation?.valid) {
       return await reuseExistingWorktree(worktreePath);
     }
-    const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
-    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
+    // Layer 1: dir exists but is not a valid worktree — clean up instead of throwing.
+    // Determines reason for log clarity (stale half-state vs orphaned dir).
+    const branchInRefs = await branchExistsInGit(repoRoot, branchName);
+    await cleanupStaleWorktreeHalfState(
+      repoRoot,
+      branchName,
+      worktreePath,
+      branchInRefs ? "stale_branch" : "orphan_dir",
+    );
+    // falls through to git worktree add below with a clean slate
   }
 
   const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
@@ -1109,8 +1177,16 @@ export async function realizeExecutionWorkspace(input: {
     if (validation?.valid) {
       return await reuseExistingWorktree(registeredBranchWorktree);
     }
-    const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
-    throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
+    // Layer 1: registered worktree entry is stale/invalid — clean it up before retrying.
+    await cleanupStaleWorktreeHalfState(repoRoot, branchName, registeredBranchWorktree, "invalid_worktree");
+    // falls through to git worktree add below
+  }
+
+  // Layer 1: even if no dir and no registered worktree, a stale branch ref from a
+  // previous failed `git worktree add -b` would cause the next attempt to fail with
+  // "branch already exists". Pre-emptively remove it here to guarantee a clean add.
+  if (!existingWorktree && !registeredBranchWorktree && await branchExistsInGit(repoRoot, branchName)) {
+    await cleanupStaleWorktreeHalfState(repoRoot, branchName, worktreePath, "stale_branch");
   }
 
   try {
@@ -1415,6 +1491,13 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         } catch (err) {
           warnings.push(err instanceof Error ? err.message : String(err));
         }
+        // Layer 3: verify removal — silent failures leave orphan dirs that block re-dispatch
+        if (await directoryExists(workspacePath)) {
+          logger.warn(
+            { workspacePath, branchName: input.workspace.branchName, workspaceId: input.workspace.id },
+            "verify_failed=dir_still_exists_after_worktree_remove",
+          );
+        }
       }
     }
     if (createdByRuntime && input.workspace.branchName) {
@@ -1438,6 +1521,14 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           warnings.push(`Skipped deleting branch "${input.workspace.branchName}": ${message}`);
+        }
+        // Layer 3: verify deletion — `-d` silently fails on unmerged branches, leaving
+        // stale refs that cause "branch already exists" on next dispatch
+        if (await branchExistsInGit(repoRoot, input.workspace.branchName)) {
+          logger.warn(
+            { branchName: input.workspace.branchName, workspaceId: input.workspace.id },
+            "verify_failed=branch_still_present_after_delete: branch may be unmerged, consider -D",
+          );
         }
       }
     }
