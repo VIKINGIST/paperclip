@@ -16,6 +16,7 @@ import {
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
   issueApprovals,
+  issueComments,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -53,6 +54,13 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// Env var: ms after a succeeded heartbeat with no explicit handoff before auto-handoff fires.
+// Default 10 min (600000 ms). Read at boot.
+const INPROGRESS_HANDOFF_TIMEOUT_MS = asNumber(
+  process.env.PAPERCLIP_INPROGRESS_HANDOFF_TIMEOUT_MS,
+  600_000,
+);
+const INPROGRESS_HANDOFF_IDEMPOTENCY_MS = 60 * 60 * 1000;
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -1726,6 +1734,252 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  async function getLatestSucceededIssueRun(companyId: string, issueId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "succeeded"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function reconcileStrandedInProgressHandoffs(opts?: { now?: Date }) {
+    const now = opts?.now ?? new Date();
+    const result = {
+      handedOff: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "in_progress"),
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    for (const issue of candidates) {
+      const agentId = issue.assigneeAgentId;
+      if (!agentId) { result.skipped += 1; continue; }
+
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== issue.companyId || agent.role !== "engineer") {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const latestSucceededRun = await getLatestSucceededIssueRun(issue.companyId, issue.id);
+      if (!latestSucceededRun?.finishedAt) {
+        result.skipped += 1;
+        continue;
+      }
+      const lastHeartbeatAt = latestSucceededRun.finishedAt;
+
+      if (now.getTime() - lastHeartbeatAt.getTime() < INPROGRESS_HANDOFF_TIMEOUT_MS) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Skip if PATCH activity occurred after the last succeeded run (60s grace window).
+      if (issue.updatedAt.getTime() > lastHeartbeatAt.getTime() + 60_000) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Skip if a different heartbeat run was created after the last succeeded one finished.
+      // Exclude the succeeded run itself (its createdAt may postdate finishedAt in test fixtures).
+      const newRunAfter = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            sql`${heartbeatRuns.id} != ${latestSucceededRun.id}`,
+            gt(heartbeatRuns.createdAt, lastHeartbeatAt),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (newRunAfter) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Skip if a new comment was posted after the last succeeded run.
+      const newCommentAfter = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, issue.companyId),
+            eq(issueComments.issueId, issue.id),
+            gt(issueComments.createdAt, lastHeartbeatAt),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (newCommentAfter) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Idempotency guard: skip if already auto-handed-off within 1h.
+      const execState = (issue.executionState ?? {}) as Record<string, unknown>;
+      const lastAutoHandoffAt = execState["lastAutoHandoffAt"];
+      if (lastAutoHandoffAt) {
+        const lastMs = typeof lastAutoHandoffAt === "string" ? new Date(lastAutoHandoffAt).getTime() : 0;
+        if (now.getTime() - lastMs < INPROGRESS_HANDOFF_IDEMPOTENCY_MS) {
+          logger.info(
+            { event: "recovery.auto_handoff_skipped_recent", issueId: issue.id, lastAutoHandoffAt },
+            "recovery.auto_handoff_skipped_recent",
+          );
+          result.skipped += 1;
+          continue;
+        }
+      }
+
+      // Resolve validator agent: role matches architect-reviewer / reviewer-* or name matches Reviewer-*.
+      const validatorAgent = await db
+        .select({ id: agents.id, name: agents.name, role: agents.role })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, issue.companyId),
+            notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
+            sql`(${agents.role} ~ '^architect-reviewer$|^reviewer-' OR ${agents.name} ~ '^Reviewer-')`,
+          ),
+        )
+        .orderBy(asc(agents.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (!validatorAgent) {
+        logger.warn(
+          { event: "recovery.no_validator_for_handoff", issueId: issue.id, companyId: issue.companyId },
+          "recovery.no_validator_for_handoff",
+        );
+        result.skipped += 1;
+        continue;
+      }
+
+      // Fetch last 1-2 implementer agent comments for the system comment body.
+      const recentAgentComments = await db
+        .select({ id: issueComments.id, body: issueComments.body, createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, issue.companyId),
+            eq(issueComments.issueId, issue.id),
+            eq(issueComments.authorAgentId, agentId),
+          ),
+        )
+        .orderBy(desc(issueComments.createdAt))
+        .limit(2)
+        .then((rows) => rows);
+
+      const nextExecutionState = { ...execState, lastAutoHandoffAt: now.toISOString() };
+      const updated = await issuesSvc.update(issue.id, {
+        assigneeAgentId: validatorAgent.id,
+        status: "todo",
+        executionState: nextExecutionState,
+      });
+      if (!updated) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const commentLines = [
+        "Auto-handoff: Implementer concluded heartbeat without explicit hand-off. Please verify acceptance criteria.",
+        "",
+        `- Previous assignee: ${agent.name}`,
+        `- Last heartbeat run: \`${latestSucceededRun.id}\` finished at ${lastHeartbeatAt.toISOString()}`,
+      ];
+      if (recentAgentComments.length > 0) {
+        commentLines.push("", "Recent implementer activity:");
+        for (const comment of recentAgentComments) {
+          const excerpt = comment.body.length > 120 ? comment.body.slice(0, 120) + "…" : comment.body;
+          commentLines.push(`- ${comment.createdAt.toISOString()}: ${excerpt.replace(/\n/g, " ")}`);
+        }
+      }
+
+      await issuesSvc.addComment(issue.id, commentLines.join("\n"), {});
+
+      logger.info(
+        {
+          event: "recovery.auto_handoff_inprogress",
+          issueId: issue.id,
+          fromAgentId: agentId,
+          toAgentId: validatorAgent.id,
+          lastHeartbeatAt: lastHeartbeatAt.toISOString(),
+          threshold: INPROGRESS_HANDOFF_TIMEOUT_MS,
+        },
+        "recovery.auto_handoff_inprogress",
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          status: "todo",
+          previousStatus: "in_progress",
+          source: "recovery.stranded_in_progress_no_handoff",
+          fromAgentId: agentId,
+          toAgentId: validatorAgent.id,
+          lastHeartbeatAt: lastHeartbeatAt.toISOString(),
+          threshold: INPROGRESS_HANDOFF_TIMEOUT_MS,
+        },
+      });
+
+      await deps.enqueueWakeup(validatorAgent.id, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "auto_handoff_inprogress",
+        payload: { issueId: issue.id },
+        idempotencyKey: `auto_handoff_inprogress:${issue.id}:${validatorAgent.id}:${now.toISOString()}`,
+      });
+
+      result.handedOff += 1;
+      result.issueIds.push(issue.id);
+    }
+
+    return result;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -2689,6 +2943,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reconcileStrandedInProgressHandoffs,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

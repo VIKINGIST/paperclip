@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { and, eq, or, inArray } from "drizzle-orm";
+import { and, desc, eq, or, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -2247,5 +2247,220 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  // ELE-64: stranded in_progress no-handoff recovery tests
+
+  async function seedStrandedInProgressHandoffFixture(input?: {
+    runFinishedAt?: Date;
+    includeReviewer?: boolean;
+    lastAutoHandoffAt?: string | null;
+    agentRole?: string;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const reviewerId = randomUUID();
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const runFinishedAt = input?.runFinishedAt ?? new Date(Date.now() - 20 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Paperclip-Implementer",
+      role: input?.agentRole ?? "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    if (input?.includeReviewer !== false) {
+      await db.insert(agents).values({
+        id: reviewerId,
+        companyId,
+        name: "Reviewer-1",
+        role: "architect-reviewer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+
+    const runCreatedAt = new Date(runFinishedAt.getTime() - 60_000);
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "succeeded",
+      runId,
+      claimedAt: runCreatedAt,
+      finishedAt: runFinishedAt,
+      createdAt: runCreatedAt,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      wakeupRequestId,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      startedAt: runCreatedAt,
+      finishedAt: runFinishedAt,
+      createdAt: runCreatedAt,
+      updatedAt: runFinishedAt,
+      livenessState: "advanced",
+    });
+
+    const execState = input?.lastAutoHandoffAt !== undefined
+      ? (input.lastAutoHandoffAt !== null ? { lastAutoHandoffAt: input.lastAutoHandoffAt } : {})
+      : {};
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stranded in-progress work for handoff test",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      checkoutRunId: runId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: new Date(runFinishedAt.getTime() - 60_000),
+      executionState: Object.keys(execState).length > 0 ? execState : null,
+      updatedAt: runFinishedAt,
+    });
+
+    return { companyId, agentId, reviewerId, runId, issueId };
+  }
+
+  it("hands off stranded in-progress engineer issue to reviewer when threshold exceeded", async () => {
+    const { companyId, agentId, reviewerId, issueId } = await seedStrandedInProgressHandoffFixture({
+      runFinishedAt: new Date(Date.now() - 20 * 60 * 1000),
+      includeReviewer: true,
+    });
+    const heartbeat = heartbeatService(db);
+    const now = new Date();
+
+    const result = await heartbeat.reconcileStrandedInProgressHandoffs({ now });
+    expect(result.handedOff).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const updated = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(updated?.status).toBe("todo");
+    expect(updated?.assigneeAgentId).toBe(reviewerId);
+    expect((updated?.executionState as Record<string, unknown> | null)?.lastAutoHandoffAt).toBeTruthy();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Auto-handoff: Implementer concluded heartbeat without explicit hand-off.");
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerId));
+    expect(wakes.length).toBeGreaterThan(0);
+    expect(wakes.some((w) => w.reason === "auto_handoff_inprogress")).toBe(true);
+
+    const actLog = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .orderBy(desc(activityLog.createdAt))
+      .then((rows) => rows[0] ?? null);
+    expect((actLog?.details as Record<string, unknown> | null)?.source).toBe("recovery.stranded_in_progress_no_handoff");
+    expect((actLog?.details as Record<string, unknown> | null)?.fromAgentId).toBe(agentId);
+    expect((actLog?.details as Record<string, unknown> | null)?.toAgentId).toBe(reviewerId);
+  });
+
+  it("skips auto-handoff when already handed off within 1h (idempotency guard)", async () => {
+    const recentHandoffAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { issueId } = await seedStrandedInProgressHandoffFixture({
+      runFinishedAt: new Date(Date.now() - 20 * 60 * 1000),
+      includeReviewer: true,
+      lastAutoHandoffAt: recentHandoffAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedInProgressHandoffs({ now: new Date() });
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("skips and warns when no validator agent exists in the company", async () => {
+    const { issueId } = await seedStrandedInProgressHandoffFixture({
+      runFinishedAt: new Date(Date.now() - 20 * 60 * 1000),
+      includeReviewer: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedInProgressHandoffs({ now: new Date() });
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("skips in-progress issue whose assignee is not an engineer role", async () => {
+    const { issueId } = await seedStrandedInProgressHandoffFixture({
+      runFinishedAt: new Date(Date.now() - 20 * 60 * 1000),
+      includeReviewer: true,
+      agentRole: "architect-reviewer",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedInProgressHandoffs({ now: new Date() });
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("skips in-progress issue within the handoff timeout window", async () => {
+    const { issueId } = await seedStrandedInProgressHandoffFixture({
+      runFinishedAt: new Date(Date.now() - 3 * 60 * 1000),
+      includeReviewer: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedInProgressHandoffs({ now: new Date() });
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
   });
 });

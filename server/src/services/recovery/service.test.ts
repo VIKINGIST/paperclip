@@ -20,7 +20,9 @@ vi.mock("../activity-log.js", () => ({
 }));
 
 vi.mock("../issue-tree-control.js", () => ({
-  issueTreeControlService: () => ({}),
+  issueTreeControlService: () => ({
+    getActivePauseHoldGate: vi.fn().mockResolvedValue(null),
+  }),
 }));
 
 // Minimal drizzle-ORM chain mock:
@@ -348,5 +350,514 @@ describe("ensureStrandedIssueRecoveryIssue [FOR OPS]-active gate (ELE-36)", () =
 
     expect(mockCreate).not.toHaveBeenCalled(); // no owner found, not a gate skip
     expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(6);
+  });
+});
+
+// ─── reconcileStrandedInProgressHandoffs (ELE-64) ────────────────────────────
+//
+// DB call order for a candidate issue (one per DB select() call):
+//   0. candidates       → issues with status=in_progress, assigneeAgentId IS NOT NULL
+//   1. getAgent         → agents table for the assignee
+//   2. hasActiveExec    → heartbeatRuns (active run check)
+//   3. hasActiveExec    → agentWakeupRequests (deferred wake check)  [Promise.all with #2]
+//   4. latestSucceeded  → heartbeatRuns with status=succeeded + issueId
+//   5. newRunAfter      → heartbeatRuns created after last succeeded run
+//   6. newCommentAfter  → issueComments created after last succeeded run
+//   ── idempotency check from issue.executionState (no DB call) ──
+//   7. validatorAgent   → agents with reviewer/architect-reviewer role or Reviewer-* name
+//   8. recentComments   → issueComments by assignee agent (last 2)
+//   then: issuesSvc.update, issuesSvc.addComment, logActivity, enqueueWakeup
+//
+describe("reconcileStrandedInProgressHandoffs (ELE-64)", () => {
+  const now = new Date("2026-01-01T12:00:00Z");
+  // 15 min ago — older than the 10-min INPROGRESS_HANDOFF_TIMEOUT_MS default
+  const OLD_HEARTBEAT = new Date(now.getTime() - 15 * 60 * 1000);
+  // 5 min ago — within the 10-min timeout window
+  const RECENT_HEARTBEAT = new Date(now.getTime() - 5 * 60 * 1000);
+  // 30 min ago — within the 1-h idempotency window
+  const IDEMPOTENCY_RECENT = new Date(now.getTime() - 30 * 60 * 1000);
+
+  const engineerAgent = { id: "agent-1", companyId: "co-1", role: "engineer", name: "Implementer-1" };
+  const reviewerAgent = { id: "reviewer-1", companyId: "co-1", role: "architect-reviewer", name: "Reviewer-1" };
+  const succeededRun = { id: "run-1", agentId: "agent-1", status: "succeeded", finishedAt: OLD_HEARTBEAT };
+
+  // issue.updatedAt is 20 min ago — before lastHeartbeatAt (15 min ago) + 60 s grace.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const baseIssue: any = {
+    id: "issue-1",
+    companyId: "co-1",
+    status: "in_progress",
+    assigneeAgentId: "agent-1",
+    assigneeUserId: null,
+    hiddenAt: null,
+    updatedAt: new Date(now.getTime() - 20 * 60 * 1000),
+    executionState: null,
+    identifier: "ELE-99",
+  };
+
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockUpdate.mockReset().mockResolvedValue({ id: "issue-1" });
+    mockAddComment.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("hands off in_progress engineer issue to reviewer after timeout", async () => {
+    const db = makeDb([
+      [baseIssue],     // 0. candidates
+      [engineerAgent], // 1. getAgent
+      [],              // 2. hasActiveExecutionPath – run
+      [],              // 3. hasActiveExecutionPath – deferredWake
+      [succeededRun],  // 4. getLatestSucceededIssueRun
+      [],              // 5. newRunAfter
+      [],              // 6. newCommentAfter
+      [reviewerAgent], // 7. validatorAgent
+      [],              // 8. recentAgentComments
+    ]);
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(undefined);
+    const svc = recoveryService(db, { enqueueWakeup });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.handedOff).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(result.issueIds).toEqual(["issue-1"]);
+    expect(mockUpdate).toHaveBeenCalledWith(
+      "issue-1",
+      expect.objectContaining({ assigneeAgentId: "reviewer-1", status: "todo" }),
+    );
+    expect(mockAddComment).toHaveBeenCalledWith(
+      "issue-1",
+      expect.stringContaining("Auto-handoff: Implementer concluded heartbeat without explicit hand-off."),
+      expect.anything(),
+    );
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      "reviewer-1",
+      expect.objectContaining({ reason: "auto_handoff_inprogress" }),
+    );
+  });
+
+  // Idempotency guard: lastAutoHandoffAt is 30 min ago (within the 1-h window).
+  // The check reads issue.executionState — no extra DB call — so the sequence
+  // stops at call 6 (newCommentAfter) and skips without touching the validator query.
+  it("skips without update when lastAutoHandoffAt is within the 1-hour idempotency window", async () => {
+    const idempotentIssue = {
+      ...baseIssue,
+      executionState: { lastAutoHandoffAt: IDEMPOTENCY_RECENT.toISOString() },
+    };
+    const db = makeDb([
+      [idempotentIssue], // 0. candidates
+      [engineerAgent],   // 1. getAgent
+      [],                // 2. hasActiveExecutionPath – run
+      [],                // 3. hasActiveExecutionPath – deferredWake
+      [succeededRun],    // 4. getLatestSucceededIssueRun
+      [],                // 5. newRunAfter
+      [],                // 6. newCommentAfter
+      // idempotency fires from executionState; calls 7+ not reached
+    ]);
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(undefined);
+    const svc = recoveryService(db, { enqueueWakeup });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.skipped).toBe(1);
+    expect(result.handedOff).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    // Exactly 7 select calls (0–6); no validator query at call 7.
+    expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(7);
+  });
+
+  // Missing validator: no reviewer-role agent found in the company.
+  // The function logs a warning and skips without patching or commenting.
+  it("skips and does not update when no validator agent exists in the company", async () => {
+    const db = makeDb([
+      [baseIssue],     // 0. candidates
+      [engineerAgent], // 1. getAgent
+      [],              // 2. hasActiveExecutionPath – run
+      [],              // 3. hasActiveExecutionPath – deferredWake
+      [succeededRun],  // 4. getLatestSucceededIssueRun
+      [],              // 5. newRunAfter
+      [],              // 6. newCommentAfter
+      [],              // 7. validatorAgent → empty (no reviewer found)
+    ]);
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(undefined);
+    const svc = recoveryService(db, { enqueueWakeup });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.skipped).toBe(1);
+    expect(result.handedOff).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // Skip: assignee has a non-engineer role — the detector must only fire for engineers.
+  it("skips when assignee agent has a non-engineer role", async () => {
+    const architectAgent = { id: "agent-1", companyId: "co-1", role: "architect", name: "Architect-1" };
+    const db = makeDb([
+      [baseIssue],      // 0. candidates
+      [architectAgent], // 1. getAgent → not engineer → skip
+    ]);
+
+    const svc = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(undefined) });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.skipped).toBe(1);
+    expect(result.handedOff).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    // Only 2 select calls before the early continue.
+    expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
+  });
+
+  // Skip: the last succeeded heartbeat is within the 10-min timeout window.
+  it("skips when last heartbeat finished within the timeout window", async () => {
+    const db = makeDb([
+      [baseIssue],                                                      // 0. candidates
+      [engineerAgent],                                                   // 1. getAgent
+      [],                                                                // 2. hasActiveExecutionPath – run
+      [],                                                                // 3. hasActiveExecutionPath – deferredWake
+      [{ ...succeededRun, finishedAt: RECENT_HEARTBEAT }],              // 4. recent run (within 10 min)
+    ]);
+
+    const svc = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(undefined) });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.skipped).toBe(1);
+    expect(result.handedOff).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileStrandedInProgressHandoffs (ELE-64)
+// DB call order per candidate (happy path):
+//   0  candidates query
+//   1  getAgent(agentId)
+//   2  hasActiveExecutionPath – heartbeatRuns active run check  (Promise.all slot A)
+//   3  hasActiveExecutionPath – agentWakeupRequests deferred check (Promise.all slot B)
+//   4  getLatestSucceededIssueRun
+//   5  newRunAfter check
+//   6  newCommentAfter check
+//   7  validatorAgent lookup
+//   8  recentAgentComments
+// ---------------------------------------------------------------------------
+describe("reconcileStrandedInProgressHandoffs (ELE-64)", () => {
+  const NOW = new Date("2025-01-01T12:00:00Z");
+  // 15 min ago — beyond 10 min threshold → should trigger handoff
+  const OLD_HEARTBEAT = new Date("2025-01-01T11:45:00Z");
+  // 5 min ago — within 10 min threshold → should NOT trigger
+  const RECENT_HEARTBEAT = new Date("2025-01-01T11:55:00Z");
+
+  const baseIssue = {
+    id: "issue-1",
+    companyId: "co-1",
+    projectId: "proj-1",
+    status: "in_progress",
+    assigneeAgentId: "agent-1",
+    assigneeUserId: null,
+    hiddenAt: null,
+    updatedAt: new Date("2025-01-01T11:40:00Z"),
+    executionState: {},
+    identifier: "ELE-TEST-1",
+  };
+
+  const engineerAgent = { id: "agent-1", companyId: "co-1", role: "engineer", name: "Implementer-1" };
+  const validatorAgentRow = { id: "reviewer-1", name: "Reviewer-1", role: "architect-reviewer" };
+  const oldRun = { id: "run-1", finishedAt: OLD_HEARTBEAT };
+
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockUpdate.mockReset().mockResolvedValue(null);
+    mockAddComment.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("A6-positive: hands off to validator when threshold exceeded", async () => {
+    mockUpdate.mockResolvedValue({ id: "issue-1" });
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const db = makeDb([
+      [baseIssue],          // 0 candidates
+      [engineerAgent],      // 1 getAgent
+      [],                   // 2 hasActiveExecutionPath – runs
+      [],                   // 3 hasActiveExecutionPath – wakes
+      [oldRun],             // 4 getLatestSucceededIssueRun
+      [],                   // 5 newRunAfter
+      [],                   // 6 newCommentAfter
+      [validatorAgentRow],  // 7 validatorAgent
+      [],                   // 8 recentAgentComments
+    ]);
+    const svc = recoveryService(db, { enqueueWakeup });
+
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now: NOW });
+
+    expect(result.handedOff).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(mockUpdate).toHaveBeenCalledWith(
+      "issue-1",
+      expect.objectContaining({ assigneeAgentId: "reviewer-1", status: "todo" }),
+    );
+    expect(mockAddComment).toHaveBeenCalledWith(
+      "issue-1",
+      expect.stringContaining("Auto-handoff: Implementer concluded heartbeat without explicit hand-off."),
+      {},
+    );
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      "reviewer-1",
+      expect.objectContaining({ reason: "auto_handoff_inprogress" }),
+    );
+  });
+
+  it("A6-idempotency: skips and logs when lastAutoHandoffAt is within 1h", async () => {
+    const issueWithRecentHandoff = {
+      ...baseIssue,
+      executionState: { lastAutoHandoffAt: "2025-01-01T11:30:00Z" }, // 30 min ago
+    };
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const db = makeDb([
+      [issueWithRecentHandoff], // 0 candidates
+      [engineerAgent],          // 1 getAgent
+      [],                       // 2 hasActiveExecutionPath – runs
+      [],                       // 3 hasActiveExecutionPath – wakes
+      [oldRun],                 // 4 getLatestSucceededIssueRun
+      [],                       // 5 newRunAfter
+      [],                       // 6 newCommentAfter
+      // idempotency guard fires here — no more DB calls
+    ]);
+    const svc = recoveryService(db, { enqueueWakeup });
+
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now: NOW });
+
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("A6-no-validator: skips and emits warning when no validator agent in company", async () => {
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const db = makeDb([
+      [baseIssue],         // 0 candidates
+      [engineerAgent],     // 1 getAgent
+      [],                  // 2 hasActiveExecutionPath – runs
+      [],                  // 3 hasActiveExecutionPath – wakes
+      [oldRun],            // 4 getLatestSucceededIssueRun
+      [],                  // 5 newRunAfter
+      [],                  // 6 newCommentAfter
+      [],                  // 7 validatorAgent lookup → empty
+    ]);
+    const svc = recoveryService(db, { enqueueWakeup });
+
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now: NOW });
+
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("A6-non-engineer: skips issue assigned to non-engineer agent", async () => {
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const db = makeDb([
+      [baseIssue],                              // 0 candidates
+      [{ ...engineerAgent, role: "ceo" }],      // 1 getAgent → not engineer
+    ]);
+    const svc = recoveryService(db, { enqueueWakeup });
+
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now: NOW });
+
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("A6-within-threshold: skips issue whose last heartbeat is within the timeout window", async () => {
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const db = makeDb([
+      [baseIssue],
+      [engineerAgent],
+      [],   // hasActiveExecutionPath – runs
+      [],   // hasActiveExecutionPath – wakes
+      [{ id: "run-2", finishedAt: RECENT_HEARTBEAT }], // 4 recent succeeded run
+    ]);
+    const svc = recoveryService(db, { enqueueWakeup });
+
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now: NOW });
+
+    expect(result.handedOff).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+});
+
+// ELE-64: reconcileStrandedInProgressHandoffs unit tests (A6)
+describe("reconcileStrandedInProgressHandoffs (ELE-64)", () => {
+  const now = new Date("2026-05-03T12:00:00.000Z");
+  // 700 s (≈11.7 min) ago — past the 600 s / 10-min default threshold
+  const lastHeartbeatAt = new Date(now.getTime() - 700_000);
+
+  const baseIssue = {
+    id: "issue-1",
+    companyId: "co-1",
+    status: "in_progress",
+    assigneeAgentId: "agent-1",
+    assigneeUserId: null,
+    hiddenAt: null,
+    updatedAt: lastHeartbeatAt,
+    executionState: null,
+    identifier: "ELE-99",
+    title: "Test issue",
+    priority: "medium",
+    projectId: null,
+    goalId: null,
+    originKind: null,
+    parentId: null,
+    billingCode: null,
+    checkoutRunId: null,
+    executionRunId: null,
+    createdAt: new Date(now.getTime() - 3_600_000),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+
+  const engineerAgent = {
+    id: "agent-1",
+    companyId: "co-1",
+    role: "engineer",
+    name: "Implementer-1",
+    status: "idle",
+  };
+
+  const succeededRun = {
+    id: "run-1",
+    agentId: "agent-1",
+    status: "succeeded",
+    finishedAt: lastHeartbeatAt,
+  };
+
+  const reviewerAgent = {
+    id: "reviewer-1",
+    name: "Reviewer-1",
+    role: "reviewer-core",
+  };
+
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockUpdate.mockReset().mockResolvedValue(null);
+    mockAddComment.mockReset().mockResolvedValue(undefined);
+  });
+
+  // A6 — positive trigger: engineer-role assignee, succeeded run > threshold ago,
+  // no new activity, no idempotency marker → hands off to reviewer.
+  // DB call order:
+  //   1. candidates scan → [baseIssue]
+  //   2. getAgent(agent-1) → [engineerAgent]
+  //   3. hasActiveExecutionPath: active runs → []
+  //   4. hasActiveExecutionPath: deferred wakeups → []
+  //   5. getLatestSucceededIssueRun → [succeededRun]
+  //   6. newRunAfter → []
+  //   7. newCommentAfter → []
+  //   8. validatorAgent → [reviewerAgent]
+  //   9. recentAgentComments → []
+  it("hands off to reviewer when engineer run succeeded > threshold ago with no new activity", async () => {
+    const db = makeDb([
+      [baseIssue],          // candidates
+      [engineerAgent],      // getAgent
+      [],                   // hasActiveExecutionPath: runs
+      [],                   // hasActiveExecutionPath: wakeup requests
+      [succeededRun],       // getLatestSucceededIssueRun
+      [],                   // newRunAfter
+      [],                   // newCommentAfter
+      [reviewerAgent],      // validatorAgent
+      [],                   // recentAgentComments
+    ]);
+
+    mockUpdate.mockResolvedValueOnce({ id: "issue-1" });
+
+    const svc = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(undefined) });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.handedOff).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(mockUpdate).toHaveBeenCalledWith(
+      "issue-1",
+      expect.objectContaining({
+        assigneeAgentId: "reviewer-1",
+        status: "todo",
+      }),
+    );
+    expect(mockAddComment).toHaveBeenCalledWith(
+      "issue-1",
+      expect.stringContaining("Auto-handoff: Implementer concluded heartbeat without explicit hand-off."),
+      expect.anything(),
+    );
+    expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(9);
+  });
+
+  // A6 — idempotency skip: issue was already auto-handed-off 30 min ago (< 1h).
+  // DB call order:
+  //   1. candidates → [issue with lastAutoHandoffAt 30 min ago]
+  //   2. getAgent → [engineerAgent]
+  //   3. hasActiveExecutionPath: runs → []
+  //   4. hasActiveExecutionPath: wakeups → []
+  //   5. getLatestSucceededIssueRun → [succeededRun]
+  //   6. newRunAfter → []
+  //   7. newCommentAfter → []
+  //   (idempotency guard fires → skip; no validator lookup)
+  it("emits recovery.auto_handoff_skipped_recent and does NOT hand off within 1h of last auto-handoff", async () => {
+    const recentHandoffAt = new Date(now.getTime() - 1_800_000).toISOString(); // 30 min ago
+    const issueWithHandoff = {
+      ...baseIssue,
+      executionState: { lastAutoHandoffAt: recentHandoffAt },
+    };
+
+    const db = makeDb([
+      [issueWithHandoff],   // candidates
+      [engineerAgent],      // getAgent
+      [],                   // hasActiveExecutionPath: runs
+      [],                   // hasActiveExecutionPath: wakeups
+      [succeededRun],       // getLatestSucceededIssueRun
+      [],                   // newRunAfter
+      [],                   // newCommentAfter
+    ]);
+
+    const svc = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(undefined) });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.handedOff).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(7);
+  });
+
+  // A6 — missing-validator skip: no reviewer agent found in the company →
+  // warning logged, no PATCH, no comment.
+  // DB call order:
+  //   1. candidates
+  //   2. getAgent
+  //   3. hasActiveExecutionPath: runs
+  //   4. hasActiveExecutionPath: wakeups
+  //   5. getLatestSucceededIssueRun
+  //   6. newRunAfter
+  //   7. newCommentAfter
+  //   8. validatorAgent → [] (none found)
+  it("skips with warning when no validator agent exists in the company", async () => {
+    const db = makeDb([
+      [baseIssue],     // candidates
+      [engineerAgent], // getAgent
+      [],              // hasActiveExecutionPath: runs
+      [],              // hasActiveExecutionPath: wakeups
+      [succeededRun],  // getLatestSucceededIssueRun
+      [],              // newRunAfter
+      [],              // newCommentAfter
+      [],              // validatorAgent → empty
+    ]);
+
+    const svc = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(undefined) });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.handedOff).toBe(0);
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(8);
   });
 });
