@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { recoveryService } from "./service.js";
+import { classifyHandoffDiff, recoveryService } from "./service.js";
 
 const mockCreate = vi.fn();
 const mockUpdate = vi.fn();
@@ -859,5 +859,138 @@ describe("reconcileStrandedInProgressHandoffs (ELE-64)", () => {
     expect(mockUpdate).not.toHaveBeenCalled();
     expect(mockAddComment).not.toHaveBeenCalled();
     expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(8);
+  });
+});
+
+// ─── A9: classifyHandoffDiff unit tests (ELE-64) ─────────────────────────────
+
+describe("classifyHandoffDiff (ELE-64 A9)", () => {
+  it("pure memory diff → AUTO_CLOSE", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/notes.md", "memory/context.canvas"],
+      diffStatLines: "2 files changed, 10 insertions(+), 2 deletions(-)",
+    });
+    expect(result.tier).toBe("AUTO_CLOSE");
+    expect(result.reason).toBe("safe-patterns-only");
+    expect(result.files).toEqual(["memory/notes.md", "memory/context.canvas"]);
+  });
+
+  it("pure code diff → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["src/services/foo.ts"],
+      diffStatLines: "1 file changed, 5 insertions(+)",
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("contains-code-files");
+  });
+
+  it("mixed memory + code → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/notes.md", "server/index.ts"],
+      diffStatLines: "2 files changed, 20 insertions(+)",
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("contains-code-files");
+  });
+
+  it("memory diff exceeding line limit → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/bigfile.md"],
+      diffStatLines: "1 file changed, 80 insertions(+), 30 deletions(-)",
+      autoCloseLineLimit: 100,
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("diff-exceeds-line-limit");
+  });
+
+  it("memory diff exactly at line limit → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/notes.md"],
+      diffStatLines: "1 file changed, 60 insertions(+), 40 deletions(-)",
+      autoCloseLineLimit: 100,
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("diff-exceeds-line-limit");
+  });
+
+  it("memory diff below line limit → AUTO_CLOSE", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/notes.md"],
+      diffStatLines: "1 file changed, 50 insertions(+), 40 deletions(-)",
+      autoCloseLineLimit: 100,
+    });
+    expect(result.tier).toBe("AUTO_CLOSE");
+  });
+
+  it("critical-path memory file → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/critical-config.md"],
+      diffStatLines: "1 file changed, 5 insertions(+)",
+      criticalPathRegex: /critical-config/,
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("critical-path-match");
+  });
+
+  it("zero diff with zero implementer comments → SKIP", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: [],
+      diffStatLines: "",
+      recentImplementerCommentCount: 0,
+    });
+    expect(result.tier).toBe("SKIP");
+    expect(result.reason).toBe("zero-diff-zero-comments");
+  });
+
+  it("zero diff with implementer comments → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: [],
+      diffStatLines: "",
+      recentImplementerCommentCount: 2,
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("zero-diff-with-implementer-comments");
+  });
+
+  it("unsafe file pattern (non-md, non-code) → REVIEWER", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["assets/icon.png"],
+      diffStatLines: "1 file changed, 1 insertion(+)",
+    });
+    expect(result.tier).toBe("REVIEWER");
+    expect(result.reason).toBe("unsafe-file-patterns");
+  });
+
+  it("README.md at root → AUTO_CLOSE", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["README.md"],
+      diffStatLines: "1 file changed, 3 insertions(+)",
+    });
+    expect(result.tier).toBe("AUTO_CLOSE");
+  });
+
+  it("docs md file → AUTO_CLOSE", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["docs/architecture.md"],
+      diffStatLines: "1 file changed, 8 insertions(+)",
+    });
+    expect(result.tier).toBe("AUTO_CLOSE");
+  });
+
+  it("adr file → AUTO_CLOSE", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["decisions/0001-adr-initial.md"],
+      diffStatLines: "1 file changed, 15 insertions(+)",
+    });
+    expect(result.tier).toBe("AUTO_CLOSE");
+  });
+
+  it("no critical-path regex (null) → AUTO_CLOSE for safe-only diff", () => {
+    const result = classifyHandoffDiff({
+      diffNameOnly: ["memory/notes.md"],
+      diffStatLines: "1 file changed, 5 insertions(+)",
+      criticalPathRegex: null,
+    });
+    expect(result.tier).toBe("AUTO_CLOSE");
   });
 });

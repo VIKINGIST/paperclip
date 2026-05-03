@@ -1,3 +1,6 @@
+import { execFile as execFileCallback } from "node:child_process";
+import fs from "node:fs/promises";
+import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, ilike, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -44,6 +47,7 @@ import {
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { resolveDefaultAgentWorkspaceDir } from "../../home-paths.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -61,6 +65,57 @@ const INPROGRESS_HANDOFF_TIMEOUT_MS = asNumber(
   600_000,
 );
 const INPROGRESS_HANDOFF_IDEMPOTENCY_MS = 60 * 60 * 1000;
+// Env var: max total diff lines (insertions + deletions) for auto-close to apply. Default 100.
+const AUTO_CLOSE_LINE_LIMIT = asNumber(process.env.PAPERCLIP_AUTO_CLOSE_LINE_LIMIT, 100);
+// Env var: regex for critical-path files that block auto-close even when all other checks pass.
+const CRITICAL_PATH_REGEX_SRC = process.env.PAPERCLIP_AUTO_CLOSE_CRITICAL_PATH_REGEX ?? "";
+const CRITICAL_PATH_REGEX = CRITICAL_PATH_REGEX_SRC ? new RegExp(CRITICAL_PATH_REGEX_SRC) : null;
+
+const SAFE_PATTERNS =
+  /^memory\/.*\.md$|CHANGELOG\.md$|^README.*\.md$|^docs\/.*\.md$|^.*adr.*\.md$|^memory\/.*\.canvas$/;
+const CODE_PATTERNS =
+  /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|cpp|h|hpp|c|sh|ps1|bat|json|yaml|yml|toml|sql|prisma|graphql)$/;
+
+export type HandoffTier = "AUTO_CLOSE" | "REVIEWER" | "SKIP";
+
+export function classifyHandoffDiff(input: {
+  diffNameOnly: string[];
+  diffStatLines: string;
+  recentImplementerCommentCount?: number;
+  autoCloseLineLimit?: number;
+  criticalPathRegex?: RegExp | null;
+}): { tier: HandoffTier; reason: string; files: string[] } {
+  const { diffNameOnly, diffStatLines } = input;
+  const lineLimit = input.autoCloseLineLimit ?? AUTO_CLOSE_LINE_LIMIT;
+  const cpRegex = input.criticalPathRegex !== undefined ? input.criticalPathRegex : CRITICAL_PATH_REGEX;
+
+  if (diffNameOnly.length === 0) {
+    if ((input.recentImplementerCommentCount ?? 0) > 0) {
+      return { tier: "REVIEWER", reason: "zero-diff-with-implementer-comments", files: [] };
+    }
+    return { tier: "SKIP", reason: "zero-diff-zero-comments", files: [] };
+  }
+
+  if (diffNameOnly.some((f) => CODE_PATTERNS.test(f))) {
+    return { tier: "REVIEWER", reason: "contains-code-files", files: diffNameOnly };
+  }
+
+  if (!diffNameOnly.every((f) => SAFE_PATTERNS.test(f))) {
+    return { tier: "REVIEWER", reason: "unsafe-file-patterns", files: diffNameOnly };
+  }
+
+  const insertions = Number(diffStatLines.match(/(\d+) insertion/)?.[1] ?? 0);
+  const deletions = Number(diffStatLines.match(/(\d+) deletion/)?.[1] ?? 0);
+  if (insertions + deletions >= lineLimit) {
+    return { tier: "REVIEWER", reason: "diff-exceeds-line-limit", files: diffNameOnly };
+  }
+
+  if (cpRegex && diffNameOnly.some((f) => cpRegex.test(f))) {
+    return { tier: "REVIEWER", reason: "critical-path-match", files: diffNameOnly };
+  }
+
+  return { tier: "AUTO_CLOSE", reason: "safe-patterns-only", files: diffNameOnly };
+}
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -1755,6 +1810,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  const execFileP = promisify(execFileCallback);
+
+  async function tryGetIssueDiff(assigneeAgentId: string, adapterConfig: unknown): Promise<{
+    nameOnly: string[];
+    statLines: string;
+  } | null> {
+    try {
+      const workspaceDir = resolveDefaultAgentWorkspaceDir(assigneeAgentId);
+      const stat = await fs.stat(workspaceDir).catch(() => null);
+      if (!stat?.isDirectory()) return null;
+      const ws = parseObject((parseObject(adapterConfig) as Record<string, unknown>)?.workspaceStrategy);
+      const baseRef = typeof ws?.baseRef === "string" && ws.baseRef ? ws.baseRef : "master";
+      const [nameOnlyResult, statResult] = await Promise.all([
+        execFileP("git", ["diff", "--name-only", `${baseRef}..HEAD`], { cwd: workspaceDir }),
+        execFileP("git", ["diff", "--shortstat", `${baseRef}..HEAD`], { cwd: workspaceDir }),
+      ]);
+      const nameOnly = nameOnlyResult.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+      return { nameOnly, statLines: statResult.stdout.trim() };
+    } catch {
+      return null;
+    }
+  }
+
   async function reconcileStrandedInProgressHandoffs(opts?: { now?: Date }) {
     const now = opts?.now ?? new Date();
     const result = {
@@ -1864,6 +1942,101 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.skipped += 1;
           continue;
         }
+      }
+
+      // Classify via git diff if the workspace is available.
+      // Falls back silently to the REVIEWER tier when the workspace can't be read.
+      const diffResult = await tryGetIssueDiff(agentId, agent.adapterConfig);
+      if (diffResult !== null) {
+        let recentImplementerCommentCount = 0;
+        if (diffResult.nameOnly.length === 0) {
+          const sixtyMinAgo = new Date(now.getTime() - 60 * 60 * 1000);
+          recentImplementerCommentCount = await db
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                eq(issueComments.authorAgentId, agentId),
+                gt(issueComments.createdAt, sixtyMinAgo),
+              ),
+            )
+            .then((rows) => rows.length);
+        }
+
+        const classification = classifyHandoffDiff({
+          diffNameOnly: diffResult.nameOnly,
+          diffStatLines: diffResult.statLines,
+          recentImplementerCommentCount,
+        });
+
+        if (classification.tier === "SKIP") {
+          logger.info(
+            { event: "recovery.handoff_skipped_ambiguous", issueId: issue.id, reason: "zero-diff-zero-comments" },
+            "recovery.handoff_skipped_ambiguous",
+          );
+          result.skipped += 1;
+          continue;
+        }
+
+        if (classification.tier === "AUTO_CLOSE") {
+          const nextExecState = {
+            ...execState,
+            lastAutoHandoffAt: now.toISOString(),
+            autoClosedReason: "safe-patterns-only",
+          };
+          const updated = await issuesSvc.update(issue.id, {
+            status: "done",
+            assigneeAgentId: null,
+            executionState: nextExecState,
+          });
+          if (!updated) {
+            result.skipped += 1;
+            continue;
+          }
+          const fileList = classification.files.map((f) => `- ${f}`).join("\n");
+          await issuesSvc.addComment(issue.id, [
+            "Auto-closed: diff matches safe patterns (memory/docs only, <100 lines, no source code).",
+            "",
+            `Files:\n${fileList}`,
+            `Lines: ${diffResult.statLines || "N/A"}`,
+            "",
+            "For retroactive audit see metadata.autoClosedReason.",
+          ].join("\n"), {});
+          logger.info(
+            {
+              event: "recovery.auto_closed_safe_patterns",
+              issueId: issue.id,
+              files: classification.files,
+              lines: diffResult.statLines,
+            },
+            "recovery.auto_closed_safe_patterns",
+          );
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              status: "done",
+              previousStatus: "in_progress",
+              source: "recovery.stranded_in_progress_no_handoff",
+              autoClosedReason: "safe-patterns-only",
+              files: classification.files,
+              lines: diffResult.statLines,
+            },
+          });
+          result.handedOff += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+        // classification.tier === "REVIEWER" — fall through to validator handoff below.
       }
 
       // Resolve validator agent: role matches architect-reviewer / reviewer-* or name matches Reviewer-*.
