@@ -2057,18 +2057,19 @@ export function issueRoutes(
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
 
-    // C. Cross-repo close: synthesize an approval comment when the caller signals
-    // no local branch exists (closeWithoutMerge=true). An issue qualifies as
-    // cross-repo if it has no execution workspace at all OR its workspace has no
-    // branchName (project_primary strategy — commits go directly to main, no
-    // per-issue branch to merge). For git_worktree issues the normal merge flow
-    // applies even when closeWithoutMerge is sent.
-    let isCrossRepoClose =
-      closeWithoutMergeRequested === true &&
-      updateFields.status === "done";
-    if (isCrossRepoClose && existing.executionWorkspaceId) {
-      const closingWorkspace = await executionWorkspacesSvc.getById(existing.executionWorkspaceId);
-      isCrossRepoClose = !closingWorkspace || !closingWorkspace.branchName;
+    // C. Cross-repo close: auto-detected when the issue has an execution workspace
+    // with no per-issue branch (project_primary — commits go directly to main).
+    // Also activated by explicit closeWithoutMerge=true; opt out with false.
+    // For git_worktree issues (branchName present) the normal merge flow applies.
+    // Issues with no workspace at all (plain assignments) are NOT auto-detected.
+    let isCrossRepoClose = updateFields.status === "done" && closeWithoutMergeRequested !== false;
+    if (isCrossRepoClose) {
+      if (existing.executionWorkspaceId) {
+        const closingWorkspace = await executionWorkspacesSvc.getById(existing.executionWorkspaceId);
+        isCrossRepoClose = !closingWorkspace || !closingWorkspace.branchName;
+      } else {
+        isCrossRepoClose = closeWithoutMergeRequested === true;
+      }
     }
     const effectiveCommentBody =
       isCrossRepoClose && !commentBody
