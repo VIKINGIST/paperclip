@@ -307,6 +307,8 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  beforeEach(() => resetWorktreeCleanupAttemptsForTests());
+
   it("falls back to project_primary when issue is null on a git_worktree agent (ELE-53 A1)", async () => {
     // Does not touch git — the guard returns early before any git ops.
     const fakeBaseCwd = "/fake/repo";
@@ -411,40 +413,44 @@ describe("realizeExecutionWorkspace", () => {
     expect(second.branchName).toBe(first.branchName);
   });
 
-  it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
+  it("cleans up an orphan directory and creates a fresh worktree (Layer 1 orphan_dir, ELE-93)", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-447-add-worktree-support";
-    const poisonedPath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
-    await fs.mkdir(poisonedPath, { recursive: true });
+    // Simulate: dir exists at the worktree path but is not registered in git worktree list
+    const orphanPath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(orphanPath, { recursive: true });
 
-    await expect(
-      realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-1",
-          workspaceId: "workspace-1",
-          repoUrl: null,
-          repoRef: "HEAD",
+    const result = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
         },
-        config: {
-          workspaceStrategy: {
-            type: "git_worktree",
-            branchTemplate: "{{issue.identifier}}-{{slug}}",
-          },
-        },
-        issue: {
-          id: "issue-1",
-          identifier: "PAP-447",
-          title: "Add Worktree Support",
-        },
-        agent: {
-          id: "agent-1",
-          name: "Codex Coder",
-          companyId: "company-1",
-        },
-      }),
-    ).rejects.toThrow(/not a reusable git worktree \(path is not registered in `git worktree list`\)\./);
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(result.strategy).toBe("git_worktree");
+    expect(result.created).toBe(true);
+    expect(result.branchName).toBe(branchName);
+    await expect(fs.stat(path.join(result.cwd, ".git"))).resolves.toBeTruthy();
   });
 
   it("reuses the current linked worktree instead of nesting another worktree inside it", async () => {
@@ -488,7 +494,7 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.realpath(realized.worktreePath ?? "")).resolves.toBe(expectedWorktreePath);
   });
 
-  it("rejects reusing a linked worktree whose branch drifted from the expected issue branch", async () => {
+  it("cleans up a registered worktree on the wrong branch and creates a fresh one (Layer 1 invalid_worktree, ELE-93)", async () => {
     const repoRoot = await createTempRepo();
 
     const initial = await realizeExecutionWorkspace({
@@ -518,36 +524,40 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
 
+    // Drift the worktree to a different branch, making it invalid for the issue
     await runGit(initial.cwd, ["checkout", "-b", "unexpected-branch"]);
 
-    await expect(
-      realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-1",
-          workspaceId: "workspace-1",
-          repoUrl: null,
-          repoRef: "HEAD",
+    const recovered = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
         },
-        config: {
-          workspaceStrategy: {
-            type: "git_worktree",
-            branchTemplate: "{{issue.identifier}}-{{slug}}",
-          },
-        },
-        issue: {
-          id: "issue-1",
-          identifier: "PAP-447",
-          title: "Add Worktree Support",
-        },
-        agent: {
-          id: "agent-1",
-          name: "Codex Coder",
-          companyId: "company-1",
-        },
-      }),
-    ).rejects.toThrow(/not a reusable git worktree \(worktree HEAD is on "unexpected-branch" instead of "PAP-447-add-worktree-support"\)\./);
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(recovered.strategy).toBe("git_worktree");
+    expect(recovered.created).toBe(true);
+    expect(recovered.branchName).toBe("PAP-447-add-worktree-support");
+    await expect(fs.stat(path.join(recovered.cwd, ".git"))).resolves.toBeTruthy();
   });
 
   it("reuses an already checked out branch from git worktree metadata even when the target path differs", async () => {
@@ -2082,6 +2092,99 @@ describe("realizeExecutionWorkspace", () => {
       cleanupAction: "branch_delete",
     });
   });
+
+  it("cleans up a stale branch ref (dir absent) before creating a fresh worktree (Layer 1 stale_branch, ELE-93)", async () => {
+    const repoRoot = await createTempRepo();
+    // Simulate a partially-failed `git worktree add -b`: branch ref was created but dir was never written
+    await execFileAsync("git", ["branch", "PAP-555-stale-branch-test", "HEAD"], { cwd: repoRoot });
+
+    const result = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-stale",
+        identifier: "PAP-555",
+        title: "Stale Branch Test",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(result.strategy).toBe("git_worktree");
+    expect(result.created).toBe(true);
+    expect(result.branchName).toBe("PAP-555-stale-branch-test");
+    await expect(fs.stat(path.join(result.cwd, ".git"))).resolves.toBeTruthy();
+  });
+
+  it("throws loop_protection_triggered after 3 stale-state cleanups for the same branch within 1h (ELE-93)", async () => {
+    const repoRoot = await createTempRepo();
+
+    async function attemptRealize() {
+      return realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-loop",
+          identifier: "PAP-LOOP",
+          title: "loop protect",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    }
+
+    async function corruptState(result: RealizedExecutionWorkspace) {
+      await execFileAsync("git", ["worktree", "remove", "--force", result.cwd], { cwd: repoRoot });
+      await execFileAsync("git", ["branch", "-D", result.branchName!], { cwd: repoRoot });
+      // Recreate as orphan dir to trigger cleanup on the next attempt
+      await fs.mkdir(result.cwd, { recursive: true });
+    }
+
+    // Attempt 1: orphan dir → cleanup fires (count=1) → succeeds
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "PAP-LOOP-loop-protect");
+    await fs.mkdir(worktreePath, { recursive: true });
+    const r1 = await attemptRealize();
+    expect(r1.created).toBe(true);
+    await corruptState(r1);
+
+    // Attempt 2: orphan dir → cleanup fires (count=2) → succeeds
+    const r2 = await attemptRealize();
+    expect(r2.created).toBe(true);
+    await corruptState(r2);
+
+    // Attempt 3: cleanup counter hits limit → throws loop_protection_triggered
+    await expect(attemptRealize()).rejects.toThrow(/loop_protection_triggered/);
+  });
 });
 
 describe("ensureRuntimeServicesForRun", () => {
@@ -3277,6 +3380,8 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
 });
 
 describe("realizeExecutionWorkspace — Layer 1 defensive cleanup (ELE-93)", () => {
+  beforeEach(() => resetWorktreeCleanupAttemptsForTests());
+
   it("recovers from stale half-state (branch exists, dir missing) without manual intervention", async () => {
     const repoRoot = await createTempRepo();
 
