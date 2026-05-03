@@ -2058,13 +2058,18 @@ export function issueRoutes(
     }
 
     // C. Cross-repo close: synthesize an approval comment when the caller signals
-    // no local branch exists (closeWithoutMerge=true) and the issue has no worktree
-    // workspace (project_primary semantics). For worktree-based issues the normal
-    // merge flow applies even when closeWithoutMerge is sent.
-    const isCrossRepoClose =
+    // no local branch exists (closeWithoutMerge=true). An issue qualifies as
+    // cross-repo if it has no execution workspace at all OR its workspace has no
+    // branchName (project_primary strategy — commits go directly to main, no
+    // per-issue branch to merge). For git_worktree issues the normal merge flow
+    // applies even when closeWithoutMerge is sent.
+    let isCrossRepoClose =
       closeWithoutMergeRequested === true &&
-      updateFields.status === "done" &&
-      !existing.executionWorkspaceId;
+      updateFields.status === "done";
+    if (isCrossRepoClose && existing.executionWorkspaceId) {
+      const closingWorkspace = await executionWorkspacesSvc.getById(existing.executionWorkspaceId);
+      isCrossRepoClose = !closingWorkspace || !closingWorkspace.branchName;
+    }
     const effectiveCommentBody =
       isCrossRepoClose && !commentBody
         ? "Closed without merge (cross-repo work — commits already on main branch)."

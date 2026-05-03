@@ -20,6 +20,8 @@ const mockHeartbeatService = vi.hoisted(() => ({
   cancelRun: vi.fn(async () => null),
 }));
 
+const mockExecutionWorkspaceGetById = vi.hoisted(() => vi.fn(async () => null as null | { id: string; branchName: string | null; status: string; closedAt: Date | null; mode: string; name: string }));
+
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
@@ -89,7 +91,7 @@ vi.mock("../services/workspace-runtime.js", () => ({
 // execution-workspaces.js is imported directly in issues.ts (bypasses services/index.js mock).
 vi.mock("../services/execution-workspaces.js", () => ({
   executionWorkspaceService: () => ({
-    getById: vi.fn(async () => null),
+    getById: mockExecutionWorkspaceGetById,
   }),
   readExecutionWorkspaceConfig: vi.fn(() => null),
 }));
@@ -158,7 +160,7 @@ function registerModuleMocks() {
 
   vi.doMock("../services/execution-workspaces.js", () => ({
     executionWorkspaceService: () => ({
-      getById: vi.fn(async () => null),
+      getById: mockExecutionWorkspaceGetById,
     }),
     readExecutionWorkspaceConfig: vi.fn(() => null),
   }));
@@ -233,6 +235,7 @@ describe("cross-repo close-flow (ELE-53 A4/A5)", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument.mockResolvedValue([]);
+    mockExecutionWorkspaceGetById.mockResolvedValue(null);
   });
 
   it("A4: closes cross-repo issue to done without requiring a comment body", async () => {
@@ -314,6 +317,70 @@ describe("cross-repo close-flow (ELE-53 A4/A5)", () => {
     const res = await request(await createApp())
       .patch(`/api/issues/${existing.id}`)
       .send({ closeWithoutMerge: true });  // no status="done"
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("C1: project_primary workspace (branchName=null) is treated as cross-repo", async () => {
+    // Issue has an executionWorkspaceId (project_primary agent checked out the issue)
+    // but the workspace has no branchName — must still synthesize the cross-repo comment.
+    const existing = makeIssue({ status: "in_progress", executionWorkspaceId: "ws-project-primary" });
+    const updated = { ...existing, status: "done" };
+
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    // Use mockResolvedValue (not Once) — issues.ts calls getById twice:
+    // once in getClosedIssueExecutionWorkspace and once in the isCrossRepoClose check.
+    mockExecutionWorkspaceGetById.mockResolvedValue({
+      id: "ws-project-primary",
+      branchName: null,
+      status: "active",
+      closedAt: null,
+      mode: "task_session",
+      name: "project-primary-ws",
+    });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "cross-repo-comment-1",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Closed without merge (cross-repo work — commits already on main branch).",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", closeWithoutMerge: true });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      existing.id,
+      expect.stringContaining("cross-repo"),
+      expect.anything(),
+    );
+  });
+
+  it("C2: git_worktree workspace (branchName set) is not treated as cross-repo", async () => {
+    // Issue has an executionWorkspaceId with a real git branch — closeWithoutMerge
+    // should NOT auto-synthesize a comment; the caller must merge normally.
+    const existing = makeIssue({ status: "in_progress", executionWorkspaceId: "ws-git-worktree" });
+    const updated = { ...existing, status: "done" };
+
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    // Use mockResolvedValue (not Once) — issues.ts calls getById twice:
+    // once in getClosedIssueExecutionWorkspace and once in the isCrossRepoClose check.
+    mockExecutionWorkspaceGetById.mockResolvedValue({
+      id: "ws-git-worktree",
+      branchName: "ELE-61-cross-repo-close",
+      status: "active",
+      closedAt: null,
+      mode: "task_session",
+      name: "git-worktree-ws",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "done", closeWithoutMerge: true });
 
     expect(res.status).toBe(200);
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
