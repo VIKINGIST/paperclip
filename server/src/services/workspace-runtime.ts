@@ -903,6 +903,10 @@ const _worktreeCleanupAttempts = new Map<string, { count: number; firstAt: numbe
 const WORKTREE_CLEANUP_LOOP_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const WORKTREE_CLEANUP_LOOP_MAX = 3;
 
+export function resetWorktreeCleanupAttemptsForTests(): void {
+  _worktreeCleanupAttempts.clear();
+}
+
 function recordWorktreeCleanupAttempt(branchName: string): void {
   const now = Date.now();
   const entry = _worktreeCleanupAttempts.get(branchName);

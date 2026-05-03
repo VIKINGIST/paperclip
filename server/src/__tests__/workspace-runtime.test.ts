@@ -36,6 +36,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   triggerWorktreeCleanupForIssue,
+  resetWorktreeCleanupAttemptsForTests,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import { writeLocalServiceRegistryRecord } from "../services/local-service-supervisor.ts";
@@ -171,6 +172,7 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+  resetWorktreeCleanupAttemptsForTests();
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -3271,6 +3273,115 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       scopeId: "execution-workspace-1",
       executionWorkspaceId: "execution-workspace-1",
     });
+  });
+});
+
+describe("realizeExecutionWorkspace — Layer 1 defensive cleanup (ELE-93)", () => {
+  it("recovers from stale half-state (branch exists, dir missing) without manual intervention", async () => {
+    const repoRoot = await createTempRepo();
+
+    // Create a worktree normally to establish a branch ref.
+    const first = await realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "p1", workspaceId: "w1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+      issue: { id: "issue-stale-1", identifier: "ELE-900", title: "Stale branch test" },
+      agent: { id: "a1", name: "Impl", companyId: "c1" },
+    });
+    expect(first.strategy).toBe("git_worktree");
+    const branchName = first.branchName!;
+
+    // Simulate the ELE-90 failure: dir was removed but branch ref was not cleaned up.
+    await fs.rm(first.cwd, { recursive: true, force: true });
+    await runGit(repoRoot, ["worktree", "prune"]);
+    // Branch ref should still exist.
+    const { stdout: branchListBefore } = await execFileAsync("git", ["branch", "--list", branchName], { cwd: repoRoot });
+    expect(branchListBefore.trim()).toBe(branchName);
+
+    // Second dispatch attempt: Layer 1 should detect stale branch, clean it, and succeed.
+    const second = await realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "p1", workspaceId: "w1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+      issue: { id: "issue-stale-1", identifier: "ELE-900", title: "Stale branch test" },
+      agent: { id: "a1", name: "Impl", companyId: "c1" },
+    });
+    expect(second.strategy).toBe("git_worktree");
+    expect(second.branchName).toBe(branchName);
+    await expect(fs.stat(path.join(second.cwd, ".git"))).resolves.toBeTruthy();
+
+    // Cleanup
+    await fs.rm(repoRoot, { recursive: true, force: true });
+  });
+
+  it("recovers from orphan dir (branch missing, dir exists with non-worktree contents)", async () => {
+    const repoRoot = await createTempRepo();
+
+    // Determine what the branch name would be.
+    const issueInput = {
+      base: { baseCwd: repoRoot, source: "project_primary" as const, projectId: "p1", workspaceId: "w1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree" as const, branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+      issue: { id: "issue-orphan-1", identifier: "ELE-901", title: "Orphan dir test" },
+      agent: { id: "a1", name: "Impl", companyId: "c1" },
+    };
+
+    // Place a plain (non-worktree) directory at the expected worktree path.
+    // We figure out the path by doing a dry run first — but it's easier to just create a
+    // dir at the computed path directly. The path follows the worktrees config convention.
+    const worktreesDir = path.join(repoRoot, ".paperclip", "worktrees");
+    await fs.mkdir(worktreesDir, { recursive: true });
+    // The branch slug for "ELE-901 Orphan dir test" → "ELE-901-orphan-dir-test"
+    const orphanPath = path.join(worktreesDir, "ELE-901-orphan-dir-test");
+    await fs.mkdir(orphanPath, { recursive: true });
+    await fs.writeFile(path.join(orphanPath, "orphan.txt"), "not a git worktree");
+
+    // No branch ref exists — only a plain dir.
+    const { stdout: branchListBefore } = await execFileAsync("git", ["branch", "--list", "ELE-901-orphan-dir-test"], { cwd: repoRoot });
+    expect(branchListBefore.trim()).toBe("");
+
+    // Layer 1 should detect orphan dir, remove it, and create a valid worktree.
+    const result = await realizeExecutionWorkspace(issueInput);
+    expect(result.strategy).toBe("git_worktree");
+    expect(result.branchName).toBe("ELE-901-orphan-dir-test");
+    await expect(fs.stat(path.join(result.cwd, ".git"))).resolves.toBeTruthy();
+    // Orphan file should not exist in the new worktree.
+    await expect(fs.stat(path.join(result.cwd, "orphan.txt"))).rejects.toThrow();
+
+    await fs.rm(repoRoot, { recursive: true, force: true });
+  });
+
+  it("throws loop_protection_triggered after 3 stale-branch cleanups for the same branch within 1h", async () => {
+    const repoRoot = await createTempRepo();
+    const issueArgs = {
+      base: { baseCwd: repoRoot, source: "project_primary" as const, projectId: "p1", workspaceId: "w1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree" as const, branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+      issue: { id: "issue-loop-1", identifier: "ELE-902", title: "Loop protection test" },
+      agent: { id: "a1", name: "Impl", companyId: "c1" },
+    };
+
+    // Helper: create stale state by deleting the worktree dir after a successful provision.
+    async function createStaleState() {
+      const ws = await realizeExecutionWorkspace(issueArgs);
+      await fs.rm(ws.cwd, { recursive: true, force: true });
+      await runGit(repoRoot, ["worktree", "prune"]);
+      return ws.branchName!;
+    }
+
+    // First cleanup — succeeds (count=1)
+    const branch = await createStaleState();
+    const ws2 = await realizeExecutionWorkspace(issueArgs);
+    expect(ws2.branchName).toBe(branch);
+
+    // Second cleanup — succeeds (count=2)
+    await fs.rm(ws2.cwd, { recursive: true, force: true });
+    await runGit(repoRoot, ["worktree", "prune"]);
+    const ws3 = await realizeExecutionWorkspace(issueArgs);
+    expect(ws3.branchName).toBe(branch);
+
+    // Third stale state — count reaches LOOP_MAX, should throw.
+    await fs.rm(ws3.cwd, { recursive: true, force: true });
+    await runGit(repoRoot, ["worktree", "prune"]);
+    await expect(realizeExecutionWorkspace(issueArgs)).rejects.toThrow("loop_protection_triggered");
+
+    await fs.rm(repoRoot, { recursive: true, force: true });
   });
 });
 
