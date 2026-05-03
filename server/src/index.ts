@@ -718,6 +718,15 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...handoffs }, "startup in-progress handoff recovery handed off issues to reviewers");
         }
       })
+      .then(async () => {
+        if (!config.agentErrorRecoveryEnabled) return;
+        const result = await heartbeat.reconcileErrorStateAgents({
+          minAgeMs: config.agentErrorRecoveryMinAgeMs,
+        });
+        if (result.recovered > 0 || result.quarantined > 0) {
+          logger.warn({ ...result }, "startup agent error-state recovery transitioned agents");
+        }
+      })
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -787,6 +796,15 @@ export async function startServer(): Promise<StartedServer> {
           const handoffs = await heartbeat.reconcileStrandedInProgressHandoffs();
           if (handoffs.handedOff > 0) {
             logger.warn({ ...handoffs }, "periodic in-progress handoff recovery handed off issues to reviewers");
+          }
+        })
+        .then(async () => {
+          if (!config.agentErrorRecoveryEnabled) return;
+          const result = await heartbeat.reconcileErrorStateAgents({
+            minAgeMs: config.agentErrorRecoveryMinAgeMs,
+          });
+          if (result.recovered > 0 || result.quarantined > 0) {
+            logger.warn({ ...result }, "periodic agent error-state recovery transitioned agents");
           }
         })
         .catch((err) => {

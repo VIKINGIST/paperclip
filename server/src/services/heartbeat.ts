@@ -4757,6 +4757,102 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function reconcileErrorStateAgents(opts?: {
+    now?: Date;
+    minAgeMs?: number;
+    flapThreshold?: number;
+    flapWindowMs?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const minAgeMs = opts?.minAgeMs ?? (2 * 60 * 1000);
+    const flapThreshold = opts?.flapThreshold ?? 3;
+    const flapWindowMs = opts?.flapWindowMs ?? (60 * 60 * 1000);
+
+    const cutoff = new Date(now.getTime() - minAgeMs);
+
+    const candidates = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.status, "error"), lte(agents.lastHeartbeatAt, cutoff)));
+
+    let recovered = 0;
+    let quarantined = 0;
+    let skipped = 0;
+
+    for (const agent of candidates) {
+      const metadata = (agent.metadata ?? {}) as Record<string, unknown>;
+
+      if (typeof metadata.autoRecoveryQuarantinedAt === "string") {
+        skipped++;
+        continue;
+      }
+
+      const flapCount = typeof metadata.autoRecoveryCount === "number" ? metadata.autoRecoveryCount : 0;
+      const flapWindowStart = typeof metadata.autoRecoveryWindowStart === "string"
+        ? new Date(metadata.autoRecoveryWindowStart).getTime()
+        : 0;
+
+      const windowExpired = (now.getTime() - flapWindowStart) > flapWindowMs;
+      const currentCount = windowExpired ? 0 : flapCount;
+
+      if (currentCount >= flapThreshold) {
+        const newMetadata: Record<string, unknown> = {
+          ...metadata,
+          autoRecoveryQuarantinedAt: now.toISOString(),
+          autoRecoveryQuarantineReason: `flap: ${currentCount} recoveries within ${Math.round(flapWindowMs / 60000)}min window`,
+        };
+        await db
+          .update(agents)
+          .set({ metadata: newMetadata, updatedAt: now })
+          .where(and(eq(agents.id, agent.id), eq(agents.status, "error")));
+        logger.warn(
+          { agentId: agent.id, agentName: agent.name, flapCount: currentCount },
+          "agent quarantined after repeated error-state auto-recovery",
+        );
+        quarantined++;
+        continue;
+      }
+
+      const newCount = currentCount + 1;
+      const newMetadata: Record<string, unknown> = {
+        ...metadata,
+        autoRecoveryCount: newCount,
+        autoRecoveryWindowStart: windowExpired || !metadata.autoRecoveryWindowStart
+          ? now.toISOString()
+          : metadata.autoRecoveryWindowStart,
+      };
+
+      const updated = await db
+        .update(agents)
+        .set({ status: "idle", metadata: newMetadata, updatedAt: now })
+        .where(and(eq(agents.id, agent.id), eq(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        publishLiveEvent({
+          companyId: updated.companyId,
+          type: "agent.status",
+          payload: {
+            agentId: updated.id,
+            status: updated.status,
+            lastHeartbeatAt: updated.lastHeartbeatAt
+              ? new Date(updated.lastHeartbeatAt).toISOString()
+              : null,
+            outcome: "auto_recovered",
+          },
+        });
+        logger.info(
+          { agentId: agent.id, agentName: agent.name, recoveryAttempt: newCount },
+          "agent auto-recovered from error state",
+        );
+        recovered++;
+      }
+    }
+
+    return { candidates: candidates.length, recovered, quarantined, skipped };
+  }
+
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues();
   }
@@ -7809,6 +7905,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!agent) return { outcome: "missing_agent" as const };
       return scheduleBoundedRetryForRun(run, agent, opts);
     },
+
+    reconcileErrorStateAgents,
 
     reconcileStrandedAssignedIssues,
 
