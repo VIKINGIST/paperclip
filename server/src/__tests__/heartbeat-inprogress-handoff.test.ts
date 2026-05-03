@@ -297,6 +297,16 @@ describeEmbeddedPostgres("heartbeat in-progress handoff recovery", () => {
     // executionState.lastAutoHandoffAt must be stamped for idempotency.
     const execState = updatedIssue?.executionState as Record<string, unknown> | null | undefined;
     expect(typeof execState?.lastAutoHandoffAt).toBe("string");
+
+    // Let the triggered reviewer run settle so afterEach cleanup is not racing.
+    const reviewerRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId))
+      .then((rows) => rows[0] ?? null);
+    if (reviewerRun) {
+      await waitForRunToSettle(heartbeatService(db), reviewerRun.id);
+    }
   });
 
   // ---------------------------------------------------------------------------
