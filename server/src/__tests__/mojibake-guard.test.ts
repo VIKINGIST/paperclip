@@ -39,7 +39,7 @@ describe("detectMojibake", () => {
   });
 
   it("detects вЂ (em-dash prefix, UTF-8 0xE2 0x80 → Win-1251)", () => {
-    const hits = detectMojibake(“ширина вЂ 230 мм”);
+    const hits = detectMojibake("вЂ em-dash test");
     expect(hits.length).toBeGreaterThan(0);
     expect(hits[0]).toBe("вЂ");
   });
