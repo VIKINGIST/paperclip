@@ -84,8 +84,31 @@ import {
 } from "../services/issue-execution-policy.js";
 import { triggerWorktreeCleanupForIssue } from "../services/workspace-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { detectMojibake } from "../lib/mojibake.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+function rejectMojibake(
+  req: Request,
+  res: Response,
+  fields: (string | null | undefined)[],
+): boolean {
+  const text = fields.filter(Boolean).join("\n");
+  if (!text) return false;
+  const sigs = detectMojibake(text);
+  if (sigs.length === 0) return false;
+  if (req.query.allowMojibake === "true") {
+    logger.warn({ signatures: sigs }, "[mojibake-guard] allowMojibake override used; storing potentially corrupted text");
+    return false;
+  }
+  res.status(400).json({
+    error: "encoding_corrupted",
+    message: "Description contains mojibake (double-encoded UTF-8 → Win-1251 → UTF-8). Re-encode source as UTF-8 before retry.",
+    signatures: sigs,
+  });
+  return true;
+}
+
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
   closeWithoutMerge: z.boolean().optional(),
@@ -1808,6 +1831,7 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    if (rejectMojibake(req, res, [req.body.title, req.body.description])) return;
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
       await assertCanAssignTasks(req, companyId);
     }
@@ -1875,6 +1899,7 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, parent.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    if (rejectMojibake(req, res, [req.body.title, req.body.description])) return;
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
       await assertCanAssignTasks(req, parent.companyId);
     }
@@ -1933,6 +1958,7 @@ export function issueRoutes(
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (rejectMojibake(req, res, [req.body.title, req.body.description])) return;
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
@@ -1942,6 +1968,7 @@ export function issueRoutes(
       req.body.assigneeAgentId as string | null | undefined,
     );
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
+    if (titleOrDescriptionChanged && rejectMojibake(req, res, [req.body.title, req.body.description])) return;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
@@ -2151,6 +2178,10 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              // ELE-104: explicit PATCH from operator/agent is authorised to
+              // transition from terminal states (done/cancelled). Automated
+              // cron callers never reach this path.
+              allowFromTerminal: true,
             },
             tx,
           );
@@ -2176,6 +2207,8 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          // ELE-104: see above
+          allowFromTerminal: true,
         });
       }
     } catch (err) {
@@ -3481,7 +3514,8 @@ export function issueRoutes(
     const commentReferenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
 
     if (effectiveMoveToTodoRequested && (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers))) {
-      const reopenedIssue = await svc.update(id, { status: "todo" });
+      // ELE-104: comment-reopen is an explicit operator/agent action.
+      const reopenedIssue = await svc.update(id, { status: "todo", allowFromTerminal: true });
       if (!reopenedIssue) {
         res.status(404).json({ error: "Issue not found" });
         return;
