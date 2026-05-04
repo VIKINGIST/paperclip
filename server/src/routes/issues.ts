@@ -1967,8 +1967,6 @@ export function issueRoutes(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
     );
-    const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
-    if (titleOrDescriptionChanged && rejectMojibake(req, res, [req.body.title, req.body.description])) return;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
