@@ -2433,3 +2433,123 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 });
+
+// ELE-104: terminal state guard — automated cron callers must not auto-flip
+// operator-cancelled issues to done/todo/any other status.
+describeEmbeddedPostgres("issueService.update terminal state guard (ELE-104)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-terminal-guard-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedIssue(status: string, agentId?: string) {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    if (agentId) {
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Implementer-1",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Test issue",
+      status,
+      priority: "medium",
+      ...(agentId ? { assigneeAgentId: agentId } : {}),
+    });
+    return { companyId, issueId };
+  }
+
+  it("returns null and preserves cancelled status when cron caller omits allowFromTerminal", async () => {
+    const { issueId } = await seedIssue("cancelled");
+
+    const result = await svc.update(issueId, { status: "done" });
+
+    expect(result).toBeNull();
+    const row = await db.select({ status: issues.status, completedAt: issues.completedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("cancelled");
+    expect(row?.completedAt).toBeNull();
+  });
+
+  it("returns null when cron caller tries to unblock a done issue (done → todo)", async () => {
+    const { issueId } = await seedIssue("done");
+
+    const result = await svc.update(issueId, { status: "todo" });
+
+    expect(result).toBeNull();
+    const row = await db.select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("done");
+  });
+
+  it("allows transition from terminal status when allowFromTerminal=true (operator PATCH path)", async () => {
+    const { issueId } = await seedIssue("cancelled");
+
+    const result = await svc.update(issueId, { status: "done", allowFromTerminal: true });
+
+    expect(result).not.toBeNull();
+    expect(result?.status).toBe("done");
+  });
+
+  // ELE-99/ELE-100 scenario: operator cancels parent issue after recovery child was created;
+  // child later completes; getWakeableParentAfterChildCompletion must return null so no
+  // issue_children_completed wakeup is queued for the cancelled parent.
+  it("ELE-99/ELE-100: getWakeableParentAfterChildCompletion returns null when parent is cancelled", async () => {
+    const agentId = randomUUID();
+    const { companyId, issueId: parentId } = await seedIssue("cancelled", agentId);
+
+    // ELE-100 recovery child completes — parent is already cancelled by operator.
+    const childId = randomUUID();
+    await db.insert(issues).values({
+      id: childId,
+      companyId,
+      parentId,
+      title: "Recover stalled issue ELE-99",
+      status: "done",
+      priority: "medium",
+    });
+
+    expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+  });
+});

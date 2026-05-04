@@ -860,6 +860,53 @@ describe("reconcileStrandedInProgressHandoffs (ELE-64)", () => {
     expect(mockAddComment).not.toHaveBeenCalled();
     expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(8);
   });
+
+  // ELE-104 — terminal state guard:
+  // Simulates the race: operator cancels ELE-99 between the candidate-query
+  // snapshot (status=in_progress) and the issuesSvc.update call.
+  // issuesSvc.update re-reads the DB, finds status=cancelled, and returns null.
+  // reconcileStrandedInProgressHandoffs must skip gracefully — no comment, no wakeup.
+  // DB call order:
+  //   1. candidates → [baseIssue (in_progress snapshot)]
+  //   2. getAgent → [engineerAgent]
+  //   3. hasActiveExecutionPath: runs → []
+  //   4. hasActiveExecutionPath: wakeups → []
+  //   5. getLatestSucceededIssueRun → [succeededRun]
+  //   6. newRunAfter → []
+  //   7. newCommentAfter → []
+  //   8. validatorAgent → [reviewerAgent]
+  //   9. recentAgentComments → []
+  //   (issuesSvc.update returns null — terminal guard blocked cron flip to done/todo)
+  it("skips without comment or wakeup when issuesSvc.update returns null (ELE-104 terminal state guard)", async () => {
+    // mockUpdate already defaults to null in beforeEach — no override needed.
+    const db = makeDb([
+      [baseIssue],     // candidates
+      [engineerAgent], // getAgent
+      [],              // hasActiveExecutionPath: runs
+      [],              // hasActiveExecutionPath: wakeups
+      [succeededRun],  // getLatestSucceededIssueRun
+      [],              // newRunAfter
+      [],              // newCommentAfter
+      [reviewerAgent], // validatorAgent
+      [],              // recentAgentComments
+    ]);
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(undefined);
+    const svc = recoveryService(db, { enqueueWakeup });
+    const result = await svc.reconcileStrandedInProgressHandoffs({ now });
+
+    expect(result.skipped).toBe(1);
+    expect(result.handedOff).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    // update must have been called (the guard fires inside issuesSvc, not before)
+    expect(mockUpdate).toHaveBeenCalledWith(
+      "issue-1",
+      expect.objectContaining({ assigneeAgentId: "reviewer-1", status: "todo" }),
+    );
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect((db.select as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(9);
+  });
 });
 
 // ─── A9: classifyHandoffDiff unit tests (ELE-64) ─────────────────────────────

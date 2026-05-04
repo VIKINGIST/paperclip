@@ -35,6 +35,7 @@ import type {
 } from "@paperclipai/shared";
 import { clampIssueRequestDepth, extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -55,6 +56,9 @@ import {
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+// ELE-104: done/cancelled are terminal — automated cron callers must not
+// auto-flip issues that an operator has explicitly moved to a terminal state.
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -2844,6 +2848,10 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /** ELE-104: pass true only from explicit operator-facing API paths (PATCH route).
+         *  Automated cron callers must NOT set this — they will get null back instead of
+         *  silently overwriting operator-set terminal status. */
+        allowFromTerminal?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -2859,6 +2867,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        allowFromTerminal,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -2869,6 +2878,16 @@ export function issueService(db: Db) {
       }
 
       if (issueData.status) {
+        // ELE-104: if the current status is terminal and the caller is automated
+        // (allowFromTerminal not set), return null so cron callers skip gracefully
+        // via their existing if(!updated) checks. Throws only for unknown statuses.
+        if (TERMINAL_ISSUE_STATUSES.has(existing.status) && issueData.status !== existing.status && !allowFromTerminal) {
+          logger.info(
+            { event: "issue.terminal_transition_blocked", issueId: id, from: existing.status, to: issueData.status },
+            "issue.terminal_transition_blocked",
+          );
+          return null;
+        }
         assertTransition(existing.status, issueData.status);
       }
 

@@ -1967,6 +1967,7 @@ export function issueRoutes(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
     );
+    const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
@@ -2165,6 +2166,23 @@ export function issueRoutes(
       }
     }
 
+    // ELE-104: emit 409 when an agent caller tries to move an issue out of a
+    // terminal state. The update() layer already returns null for these (so
+    // cron-path callers silently skip), but from the PATCH route the correct
+    // HTTP signal is 409 — an agent processing a stale "children_completed"
+    // wake must know the issue is closed, not confuse the 404 with "not found".
+    if (
+      updateFields.status &&
+      isClosedIssueStatus(existing.status) &&
+      updateFields.status !== existing.status &&
+      actor.actorType !== "user"
+    ) {
+      res.status(409).json({
+        error: `Cannot transition issue from terminal status '${existing.status}' — requires operator action`,
+      });
+      return;
+    }
+
     let issue;
     try {
       if (transition.decision && decisionId) {
@@ -2176,10 +2194,10 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
-              // ELE-104: explicit PATCH from operator/agent is authorised to
-              // transition from terminal states (done/cancelled). Automated
-              // cron callers never reach this path.
-              allowFromTerminal: true,
+              // ELE-104: only explicit user (operator) PATCH may transition from
+              // a terminal state. Agent PATCH is blocked so a stale wake cannot
+              // auto-flip a cancelled issue back to done.
+              allowFromTerminal: actor.actorType === "user",
             },
             tx,
           );
@@ -2206,7 +2224,7 @@ export function issueRoutes(
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
           // ELE-104: see above
-          allowFromTerminal: true,
+          allowFromTerminal: actor.actorType === "user",
         });
       }
     } catch (err) {

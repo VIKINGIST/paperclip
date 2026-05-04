@@ -1981,6 +1981,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (classification.tier === "AUTO_CLOSE") {
+          // ELE-104: re-fetch the issue status immediately before writing to
+          // guard against a race where the operator explicitly cancelled/closed
+          // it between the initial candidate scan and now.  The service-layer
+          // terminal-state guard in issuesSvc.update also returns null for this
+          // case, but an early skip here avoids writing the comment too.
+          const freshForAutoClose = await db
+            .select({ status: issues.status })
+            .from(issues)
+            .where(eq(issues.id, issue.id))
+            .then((rows) => rows[0] ?? null);
+          if (!freshForAutoClose || ["done", "cancelled"].includes(freshForAutoClose.status)) {
+            logger.info(
+              { event: "recovery.auto_close_skipped_terminal_race", issueId: issue.id, freshStatus: freshForAutoClose?.status ?? null },
+              "recovery.auto_close_skipped_terminal_race",
+            );
+            result.skipped += 1;
+            continue;
+          }
           const nextExecState = {
             ...execState,
             lastAutoHandoffAt: now.toISOString(),
