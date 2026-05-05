@@ -2172,11 +2172,14 @@ export function issueRoutes(
     // cron-path callers silently skip), but from the PATCH route the correct
     // HTTP signal is 409 — an agent processing a stale "children_completed"
     // wake must know the issue is closed, not confuse the 404 with "not found".
+    // Exempt explicit resume intent (resume:true) — that is a deliberate
+    // follow-up action, not a stale auto-flip.
     if (
       updateFields.status &&
       isClosedIssueStatus(existing.status) &&
       updateFields.status !== existing.status &&
-      actor.actorType !== "user"
+      actor.actorType !== "user" &&
+      !resumeRequested
     ) {
       res.status(409).json({
         error: `Cannot transition issue from terminal status '${existing.status}' — requires operator action`,
@@ -2224,8 +2227,8 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          // ELE-104: see above
-          allowFromTerminal: actor.actorType === "user",
+          // ELE-104: see above. Explicit resume intent is not a stale auto-flip.
+          allowFromTerminal: actor.actorType === "user" || resumeRequested === true,
         });
       }
     } catch (err) {
