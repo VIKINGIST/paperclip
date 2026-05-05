@@ -26,6 +26,7 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getDependencyReadiness: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -156,7 +157,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actorOverride?: Record<string, unknown>) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -164,7 +165,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = actorOverride ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -211,6 +212,7 @@ describe("issue update comment wakeups", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -397,6 +399,118 @@ describe("issue update comment wakeups", () => {
         workspaceId: WORKSPACE_ID,
       }),
     );
+  });
+
+  // ELE-131: Blocked wake throttle
+
+  it("does not wake assignee on blocked issue when agent posts comment (ELE-131)", async () => {
+    const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    const updated = { ...existing };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-blocked-agent",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "still processing",
+    });
+
+    const res = await request(
+      await createApp({
+        type: "agent",
+        agentId: OTHER_AGENT_ID,
+        companyId: "company-1",
+        source: "bearer_token",
+        isInstanceAdmin: false,
+      }),
+    )
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "still processing" });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes assignee on blocked issue when user posts comment (ELE-131)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    const updatedToTodo = { ...existing, status: "todo" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updatedToTodo);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-blocked-user",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "please fix this now",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "please fix this now" });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalled();
+  });
+
+  it("wakes assignee on initial assignment (null→agentId) to blocked issue (ELE-131)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      status: "blocked",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_assigned" }),
+    );
+  });
+
+  it("does not wake assignee on non-initial re-assignment on blocked issue (ELE-131)", async () => {
+    const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+    const existing = makeIssue({
+      assigneeAgentId: OTHER_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("synthesizes approval comment and accepts done transition with closeWithoutMerge:true (ELE-53 C)", async () => {

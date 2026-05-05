@@ -34,6 +34,7 @@ import {
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
+import { shouldThrottleBlockedIssueWake } from "../lib/blocked-wake-throttle.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
@@ -2573,33 +2574,37 @@ export function issueRoutes(
       if (executionStageWakeup) {
         addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
       } else if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
-        addWakeup(issue.assigneeAgentId, {
-          source: "assignment",
-          triggerDetail: "system",
-          reason: "issue_assigned",
-          payload: {
-            issueId: issue.id,
-            ...(comment ? { commentId: comment.id } : {}),
-            mutation: "update",
-            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-          },
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-          contextSnapshot: {
-            issueId: issue.id,
-            ...(comment
-              ? {
-                  taskId: issue.id,
-                  commentId: comment.id,
-                  wakeCommentId: comment.id,
-                }
-              : {}),
-            source: "issue.update",
-            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-          },
-        });
+        if (shouldThrottleBlockedIssueWake({ issueStatus: issue.status, eventType: "issue_assigned", actorType: actor.actorType as "agent" | "user" | "system" | "board", previousAssigneeAgentId: existing.assigneeAgentId })) {
+          logger.info({ issueId: issue.id, eventType: "issue_assigned", reason: "blocked_no_user_input" }, "wake_throttled");
+        } else {
+          addWakeup(issue.assigneeAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: {
+              issueId: issue.id,
+              ...(comment ? { commentId: comment.id } : {}),
+              mutation: "update",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: issue.id,
+              ...(comment
+                ? {
+                    taskId: issue.id,
+                    commentId: comment.id,
+                    wakeCommentId: comment.id,
+                  }
+                : {}),
+              source: "issue.update",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+          });
+        }
       }
 
       if (
@@ -2634,7 +2639,8 @@ export function issueRoutes(
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        const skipAssigneeCommentWake = selfComment || isClosed;
+        const isBlockedWithNonUserComment = shouldThrottleBlockedIssueWake({ issueStatus: issue.status, eventType: "issue_commented", actorType: actor.actorType as "agent" | "user" | "system" | "board" });
+        const skipAssigneeCommentWake = selfComment || isClosed || isBlockedWithNonUserComment;
 
         if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
           addWakeup(assigneeId, {
@@ -2663,6 +2669,10 @@ export function issueRoutes(
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },
           });
+        }
+
+        if (assigneeId && isBlockedWithNonUserComment && !reopened) {
+          logger.info({ issueId: issue.id, eventType: "issue_commented", reason: "blocked_no_user_input" }, "wake_throttled");
         }
 
         let mentionedIds: string[] = [];
@@ -3649,7 +3659,11 @@ export function issueRoutes(
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
-      const skipWake = selfComment || isClosed;
+      const isBlockedWithNonUserComment = shouldThrottleBlockedIssueWake({ issueStatus: currentIssue.status, eventType: "issue_commented", actorType: actor.actorType as "agent" | "user" | "system" | "board" });
+      const skipWake = selfComment || isClosed || isBlockedWithNonUserComment;
+      if (assigneeId && isBlockedWithNonUserComment && !reopened) {
+        logger.info({ issueId: currentIssue.id, eventType: "issue_commented", reason: "blocked_no_user_input" }, "wake_throttled");
+      }
       if (assigneeId && (reopened || !skipWake)) {
         if (reopened) {
           wakeups.set(assigneeId, {
