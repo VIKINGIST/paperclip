@@ -492,7 +492,6 @@ describe("issue update comment wakeups", () => {
   });
 
   it("does not wake assignee on non-initial re-assignment on blocked issue (ELE-131)", async () => {
-    const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
     const existing = makeIssue({
       assigneeAgentId: OTHER_AGENT_ID,
       assigneeUserId: null,
@@ -513,6 +512,62 @@ describe("issue update comment wakeups", () => {
     expect(res.status).toBe(200);
     await new Promise((r) => setTimeout(r, 20));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not wake assignee on POST /comments from agent on blocked issue (ELE-131)", async () => {
+    const issue = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-post-agent-blocked",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "NUMBERING NOTE: sub-issues created ELE-126..130",
+    });
+
+    const res = await request(
+      await createApp({
+        type: "agent",
+        agentId: ASSIGNEE_AGENT_ID,
+        companyId: "company-1",
+        source: "bearer_token",
+        isInstanceAdmin: false,
+      }),
+    )
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "NUMBERING NOTE: sub-issues created ELE-126..130" });
+
+    expect(res.status).toBe(201);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes assignee on POST /comments from user on blocked issue (ELE-131)", async () => {
+    const issue = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "blocked",
+    });
+    const reopenedIssue = { ...issue, status: "todo" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(reopenedIssue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-post-user-blocked",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "can you check the status?",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "can you check the status?" });
+
+    expect(res.status).toBe(201);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalled();
   });
 
   it("synthesizes approval comment and accepts done transition with closeWithoutMerge:true (ELE-53 C)", async () => {
