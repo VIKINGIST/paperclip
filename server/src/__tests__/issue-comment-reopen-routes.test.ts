@@ -1350,3 +1350,83 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 });
+
+describe.sequential("blocked-issue wake throttle — POST /comments (ELE-131)", () => {
+  const ASSIGNEE_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockHeartbeatService.wakeup.mockResolvedValue(undefined);
+    mockHeartbeatService.reportRunActivity.mockResolvedValue(undefined);
+    mockHeartbeatService.getRun.mockResolvedValue(null);
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-blocked-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "test",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: null,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: ["blocker-1"],
+      unresolvedBlockerIssueIds: ["blocker-1"],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+    mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue(null);
+    mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
+    mockLogActivity.mockResolvedValue(undefined);
+    mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+    mockInstanceSettingsService.get.mockResolvedValue({
+      id: "instance-settings-1",
+      general: { censorUsernameInLogs: false, feedbackDataSharingPreference: "prompt" },
+    });
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+  });
+
+  it("suppresses wake when blocked-issue receives the assignee-agent's own comment", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(
+      await installActor(createApp(), agentActor(ASSIGNEE_AGENT_ID)),
+    )
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "Triage: ELE-126 still in_progress, nothing to act on here." });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.anything(),
+    );
+  });
+
+  it("fires wake when blocked-issue receives a user-authored comment", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(
+      await installActor(createApp()),
+    )
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "Unblock this please — ELE-126 shipped yesterday." });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({ reason: "issue_commented" }),
+      ),
+    );
+  });
+});

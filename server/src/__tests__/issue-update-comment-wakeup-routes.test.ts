@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const WORKSPACE_ID = "workspace-1111-1111-4111-8111-111111111111";
 
 const mockTriggerWorktreeCleanup = vi.hoisted(() => vi.fn(async () => {}));
@@ -404,7 +405,8 @@ describe("issue update comment wakeups", () => {
   // ELE-131: Blocked wake throttle
 
   it("does not wake assignee on blocked issue when agent posts comment (ELE-131)", async () => {
-    const OTHER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+    // Actor is the assignee itself — blocked status suppresses the comment wake
+    // via isBlockedWithNonUserComment (actor.actorType !== "user").
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
@@ -423,7 +425,7 @@ describe("issue update comment wakeups", () => {
     const res = await request(
       await createApp({
         type: "agent",
-        agentId: OTHER_AGENT_ID,
+        agentId: ASSIGNEE_AGENT_ID,
         companyId: "company-1",
         source: "bearer_token",
         isInstanceAdmin: false,
