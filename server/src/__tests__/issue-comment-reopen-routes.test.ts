@@ -1349,6 +1349,70 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     ));
   });
+
+  // ELE-131: wake throttle on blocked issues
+  it("drops assignee wake on POST comment when actor is the assignee agent and issue is blocked (ELE-131 AC1)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "heartbeat output — decomposition complete" });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("drops assignee wake on PATCH comment when actor is the assignee agent and issue is blocked (ELE-131 AC1)", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(issue);
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "system auto-handoff output, no action needed" });
+
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("fires issue_assigned wake on PATCH when issue is blocked and it is the initial assignment null→agentId (ELE-131 AC4)", async () => {
+    const existing = { ...makeIssue("blocked"), assigneeAgentId: null };
+    const updated = { ...existing, assigneeAgentId: "22222222-2222-4222-8222-222222222222" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ assigneeAgentId: "22222222-2222-4222-8222-222222222222" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          source: "assignment",
+          reason: "issue_assigned",
+        }),
+      ),
+    );
+  });
+
+  it("drops issue_assigned wake on PATCH when issue is blocked and it is a non-initial reassignment (ELE-131 AC1)", async () => {
+    const existing = makeIssue("blocked");
+    const updated = { ...existing, assigneeAgentId: "44444444-4444-4444-8444-444444444444" };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ assigneeAgentId: "44444444-4444-4444-8444-444444444444" });
+
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
 });
 
 describe.sequential("blocked-issue wake throttle — POST /comments (ELE-131)", () => {
