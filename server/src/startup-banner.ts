@@ -34,6 +34,8 @@ type StartupBannerOptions = {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  /** Set to true when a stale postmaster.pid was detected and cleaned on this startup. */
+  postgresRecoveryTriggered?: boolean;
 };
 
 const ansi = {
@@ -133,6 +135,12 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const dbBackup = opts.databaseBackupEnabled
     ? `enabled ${color(`(every ${opts.databaseBackupIntervalMinutes}m, keep ${opts.databaseBackupRetentionDays}d)`, "dim")}`
     : color("disabled", "yellow");
+  const pgRecovery =
+    opts.db.mode === "embedded-postgres"
+      ? opts.postgresRecoveryTriggered
+        ? color("triggered", "yellow") + color(" (stale postmaster.pid cleaned)", "dim")
+        : color("auto-clean ready", "green")
+      : null;
 
   const art = [
     color("██████╗  █████╗ ██████╗ ███████╗██████╗  ██████╗██╗     ██╗██████╗ ", "cyan"),
@@ -165,6 +173,7 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
     row("Heartbeat", heartbeat),
     row("DB Backup", dbBackup),
     row("Backup Dir", opts.databaseBackupDir),
+    pgRecovery !== null ? row("PG Recovery", pgRecovery) : null,
     row("Config", configPath),
     agentJwtSecret.status === "warn"
       ? color("  ───────────────────────────────────────────────────────", "yellow")

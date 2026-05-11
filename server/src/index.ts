@@ -267,6 +267,7 @@ export async function startServer(): Promise<StartedServer> {
   let migrationSummary: MigrationSummary = "skipped";
   let activeDatabaseConnectionString: string;
   let resolvedEmbeddedPostgresPort: number | null = null;
+  let postgresRecoveryTriggered = false;
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
@@ -341,38 +342,70 @@ export async function startServer(): Promise<StartedServer> {
         return false;
       }
     };
-  
-    const getRunningPid = (): number | null => {
-      if (!existsSync(postmasterPidFile)) return null;
+
+    // Returns structured pid-file state so callers can distinguish alive / stale / absent.
+    // A stale file (pid exists but process is dead) means Postgres was abruptly terminated;
+    // any orphan process on the configured port is in unknown state and must not be reused.
+    type PostmasterPidState =
+      | { kind: "alive"; pid: number }
+      | { kind: "stale"; pid: number }
+      | { kind: "absent" };
+
+    const checkPostmasterPid = (): PostmasterPidState => {
+      if (!existsSync(postmasterPidFile)) return { kind: "absent" };
       try {
         const pidLine = readFileSync(postmasterPidFile, "utf8").split("\n")[0]?.trim();
         const pid = Number(pidLine);
-        if (!Number.isInteger(pid) || pid <= 0) return null;
-        if (!isPidRunning(pid)) return null;
-        return pid;
+        if (!Number.isInteger(pid) || pid <= 0) return { kind: "absent" };
+        if (!isPidRunning(pid)) return { kind: "stale", pid };
+        return { kind: "alive", pid };
       } catch {
-        return null;
+        return { kind: "absent" };
       }
     };
-  
-    const runningPid = getRunningPid();
-    if (runningPid) {
-      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
+
+    const pidState = checkPostmasterPid();
+    if (pidState.kind === "alive") {
+      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${pidState.pid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
-      try {
-        const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
-        if (
-          typeof actualDataDir !== "string" ||
-          resolve(actualDataDir) !== resolve(dataDir)
-        ) {
-          throw new Error("reachable postgres does not use the expected embedded data directory");
-        }
-        await ensurePostgresDatabase(configuredAdminConnectionString, "paperclip");
+      // If the pid file existed but the recorded process is dead, clean it up immediately.
+      // Do NOT probe the configured port for a reusable postgres — any process still running
+      // there is an orphan in unknown state and must not be reused.
+      if (pidState.kind === "stale") {
         logger.warn(
-          `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
+          { event: "postmaster_pid_cleanup", oldPid: pidState.pid, action: "removed_stale" },
+          `Stale postmaster.pid detected (oldPid=${pidState.pid}); removing and forcing clean Postgres restart`,
         );
-      } catch {
+        rmSync(postmasterPidFile, { force: true });
+        postgresRecoveryTriggered = true;
+      }
+
+      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
+      let reuseExisting = false;
+
+      if (pidState.kind === "absent") {
+        // No pid file at all — probe whether postgres is already reachable (e.g., started by a
+        // prior process that exited without leaving a pid file). Only trust it if the data
+        // directory matches what we expect.
+        try {
+          const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
+          if (
+            typeof actualDataDir !== "string" ||
+            resolve(actualDataDir) !== resolve(dataDir)
+          ) {
+            throw new Error("reachable postgres does not use the expected embedded data directory");
+          }
+          await ensurePostgresDatabase(configuredAdminConnectionString, "paperclip");
+          logger.warn(
+            `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
+          );
+          reuseExisting = true;
+        } catch {
+          // postgres not reachable — will start fresh below
+        }
+      }
+
+      if (!reuseExisting) {
         const detectedPort = await detectPort(configuredPort);
         if (detectedPort !== configuredPort) {
           logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
@@ -404,8 +437,13 @@ export async function startServer(): Promise<StartedServer> {
           logger.info(`Embedded PostgreSQL cluster already exists (${clusterVersionFile}); skipping init`);
         }
 
+        // Guard: remove any residual pid file before start (stale case already cleaned above;
+        // this catches any file that appeared between that check and now)
         if (existsSync(postmasterPidFile)) {
-          logger.warn("Removing stale embedded PostgreSQL lock file");
+          logger.warn(
+            { event: "postmaster_pid_cleanup", action: "removed_before_start" },
+            "Removing residual postmaster.pid before starting Postgres",
+          );
           rmSync(postmasterPidFile, { force: true });
         }
         try {
@@ -875,20 +913,21 @@ export async function startServer(): Promise<StartedServer> {
           bind: config.bind,
           host: config.host,
           deploymentMode: config.deploymentMode,
-        deploymentExposure: config.deploymentExposure,
-        authReady,
-        requestedPort: requestedListenPort,
-        listenPort,
-        uiMode,
-        db: startupDbInfo,
-        migrationSummary,
-        heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
-        heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
-        databaseBackupEnabled: config.databaseBackupEnabled,
-        databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
-        databaseBackupRetentionDays: config.databaseBackupRetentionDays,
-        databaseBackupDir: config.databaseBackupDir,
-      });
+          deploymentExposure: config.deploymentExposure,
+          authReady,
+          requestedPort: requestedListenPort,
+          listenPort,
+          uiMode,
+          db: startupDbInfo,
+          migrationSummary,
+          heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
+          heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
+          databaseBackupEnabled: config.databaseBackupEnabled,
+          databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
+          databaseBackupRetentionDays: config.databaseBackupRetentionDays,
+          databaseBackupDir: config.databaseBackupDir,
+          postgresRecoveryTriggered,
+        });
 
       const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
       if (boardClaimUrl) {
