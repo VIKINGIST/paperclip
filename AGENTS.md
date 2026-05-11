@@ -155,7 +155,51 @@ When adding endpoints:
 - Use company selection context for company-scoped pages
 - Surface failures clearly; do not silently ignore API errors
 
-## 10. Pull Request Requirements
+## 10. Subprocess I/O Timeout Watchdog (ELE-195)
+
+Agents that make Anthropic API calls can hang silently when a network drop or
+rate-limit stall leaves the SDK `read()` blocked without raising an exception.
+The existing `timeoutSec`/`maxTurnsPerRun` run limits are **turn-boundary-based**
+and do not fire in this case. The `scanIoTimeoutRuns()` watchdog (in
+`server/src/services/heartbeat.ts`) fills this gap.
+
+### How it works
+
+- Runs on the same periodic scheduler tick as `scanSilentActiveRuns` (≈60s).
+- For each `status=running` heartbeat run, reads `ioTimeoutSec` from the
+  agent's `adapterConfig`. **If the field is absent or 0, the run is skipped**
+  (opt-in safety).
+- If `now - lastOutputAt > ioTimeoutSec`, the watchdog:
+  1. Calls `terminateHeartbeatRunProcess` (SIGTERM → SIGKILL after grace period).
+  2. Sets `run.status='failed'`, `errorCode='io_timeout'`.
+  3. PATCHes the source issue to `status='blocked'`, `assigneeAgentId=null`.
+  4. Posts an audit comment on the issue with silence duration and threshold.
+  5. Logs a structured `{ event: 'io_timeout_kill', ... }` activity entry.
+- Source issues with terminal status (`backlog`, `cancelled`, `done`) are
+  **skipped** to prevent action on already-resolved work (ELE-110 pre-emptive).
+
+### Per-agent defaults (current fleet)
+
+| Agent | `ioTimeoutSec` | Rationale |
+|---|---|---|
+| Reviewer-Architecture | 600 (10 min) | Code review; LLM calls bounded |
+| Implementer-1 | 900 (15 min) | Code edits; longer file reads OK |
+| Implementer-2 | 900 (15 min) | Same as Implementer-1 |
+| Implementer-Architecture | 1200 (20 min) | Opus is slower; allow more headroom |
+
+To set or update a timeout, PATCH the agent's `adapterConfig` via the board UI
+or the API (`PATCH /api/agents/:id` with `{ adapterConfig: { ioTimeoutSec: N } }`).
+Only the board session or a CEO-role agent may update other agents' configs.
+
+### Anti-patterns
+
+- **Do not auto-retry** after an `io_timeout` kill — the agent is likely to
+  hang again for the same root cause. The `blocked` status is intentional;
+  human triage should confirm before re-assigning.
+- **Do not set thresholds below 180s** — legitimate long Opus thinking turns or
+  large file reads can produce 2-3 min gaps in output.
+
+## 12. Pull Request Requirements
 
 When creating a pull request (via `gh pr create` or any other method), you **must** read and fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do not craft ad-hoc PR bodies — use the template as the structure for your PR description. Required sections:
 
@@ -166,7 +210,7 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
 - **Checklist** — all items checked
 
-## 11. Definition of Done
+## 13. Definition of Done
 
 A change is done when all are true:
 
@@ -176,7 +220,7 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
-## 11. Fork-Specific: HenkDz/paperclip
+## 14. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and an **external-only** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).
 
