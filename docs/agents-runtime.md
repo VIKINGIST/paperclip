@@ -70,6 +70,38 @@ For local adapters, set:
 - optional env vars and extra CLI args
 - use **Test environment** in agent configuration to run adapter-specific diagnostics before saving
 
+## 3.3.1 Subprocess I/O timeout (`ioTimeoutSec`)
+
+**Problem:** `timeoutSec` is a turn-boundary timer — it fires only when a heartbeat run finishes its current tool call. A subprocess stuck in a `read()` stall (network drop, silent API hang, rate-limit without exception) can sit at `status=running` indefinitely.
+
+**Solution:** set `ioTimeoutSec` in `adapterConfig` to enable the I/O watchdog:
+
+```json
+{
+  "ioTimeoutSec": 600
+}
+```
+
+The watchdog polls every ~60 s. If a run has emitted no stdout for longer than `ioTimeoutSec`, the server:
+
+1. Sends SIGTERM to the subprocess (SIGKILL after 5 s if still alive)
+2. Marks the run `status=failed`, `errorCode=io_timeout`
+3. Sets the source issue to `status=blocked`, `assigneeAgentId=null`
+4. Posts an audit comment with the silence duration
+
+**Opt-in:** agents without `ioTimeoutSec` set (or set to 0) are skipped — no accidental kills.
+
+**Recommended defaults per role:**
+
+| Agent role | `ioTimeoutSec` | Rationale |
+|---|---|---|
+| Reviewer-Architecture | 600 (10 min) | Code review turns typically complete well under 10 min |
+| Implementer | 900 (15 min) | Longer code edits are normal; 15 min is safe headroom |
+| Implementer-Architecture (Opus) | 1200 (20 min) | Opus reasoning is slower; extra margin avoids false kills |
+| Other agents | 600 | Conservative default for short-turn agents |
+
+**Skip rules:** the watchdog does NOT kill a run if the source issue status is `backlog`, `cancelled`, or `done` — terminal issues are ignored to prevent action on already-resolved work (ELE-110 pre-emptive fix).
+
 ## 3.4 Prompt templates
 
 You can set:
