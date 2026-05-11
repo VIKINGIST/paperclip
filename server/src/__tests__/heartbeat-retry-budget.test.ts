@@ -169,13 +169,13 @@ describeEmbeddedPostgres("per-source-issue retry budget", () => {
     expect(comments[0]?.body).toContain("3 failed runs");
     expect(comments[0]?.body).toContain("30 minutes");
 
-    // No new heartbeat run was queued
+    // No new heartbeat run was queued for this issue
     const newRuns = await db
       .select()
       .from(heartbeatRuns)
       .where(
         and(
-          eq(heartbeatRuns.agentId, (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.assigneeAgentId ?? ""),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           eq(heartbeatRuns.status, "queued"),
         ),
       );

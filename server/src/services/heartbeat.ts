@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -3341,6 +3341,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           eq(heartbeatRuns.agentId, run.agentId),
+          ne(heartbeatRuns.id, run.id),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           eq(heartbeatRuns.status, "failed"),
           gte(heartbeatRuns.finishedAt, windowStart),
