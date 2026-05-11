@@ -4878,6 +4878,141 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.scanSilentActiveRuns(opts);
   }
 
+  async function scanIoTimeoutRuns(opts?: { now?: Date; companyId?: string }) {
+    const now = opts?.now ?? new Date();
+
+    const candidates = await db
+      .select({
+        run: heartbeatRuns,
+        agentAdapterConfig: agents.adapterConfig,
+        agentName: agents.name,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+          eq(heartbeatRuns.status, "running"),
+          sql`${heartbeatRuns.lastOutputAt} is not null`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(100);
+
+    const result = { scanned: candidates.length, killed: 0, skipped: 0 };
+
+    for (const { run, agentAdapterConfig, agentName } of candidates) {
+      const agentNameKey = normalizeAgentNameKey(agentName);
+      const ioTimeoutSec = asNumber(parseObject(agentAdapterConfig).ioTimeoutSec, 0);
+      if (!ioTimeoutSec || ioTimeoutSec <= 0) { result.skipped += 1; continue; }
+
+      const lastOutputMs = run.lastOutputAt ? new Date(run.lastOutputAt).getTime() : null;
+      if (!lastOutputMs) { result.skipped += 1; continue; }
+
+      const silenceMs = now.getTime() - lastOutputMs;
+      if (silenceMs < ioTimeoutSec * 1000) { result.skipped += 1; continue; }
+
+      // Skip if source issue is in a terminal status (ELE-110 pre-emptive fix)
+      const sourceIssueId = readNonEmptyString(parseObject(run.contextSnapshot)?.issueId);
+      const sourceIssue = sourceIssueId
+        ? await db
+            .select()
+            .from(issues)
+            .where(and(eq(issues.companyId, run.companyId), eq(issues.id, sourceIssueId)))
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+        : null;
+      if (sourceIssue && ["backlog", "cancelled", "done"].includes(sourceIssue.status)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      logger.warn(
+        {
+          event: "io_timeout_kill",
+          runId: run.id,
+          issueId: sourceIssue?.id ?? null,
+          agentId: run.agentId,
+          agentNameKey,
+          silenceMs,
+          lastOutputSeq: run.lastOutputSeq,
+        },
+        "io_timeout_kill",
+      );
+
+      const running = runningProcesses.get(run.id);
+      if (running) {
+        await terminateHeartbeatRunProcess({
+          pid: running.child.pid ?? run.processPid,
+          processGroupId: running.processGroupId ?? run.processGroupId,
+          graceMs: Math.max(1, running.graceSec) * 1000,
+        });
+      } else if (run.processPid || run.processGroupId) {
+        await terminateHeartbeatRunProcess({ pid: run.processPid, processGroupId: run.processGroupId });
+      }
+
+      const failed = await setRunStatus(run.id, "failed", {
+        finishedAt: now,
+        error: `io_timeout: ${Math.round(silenceMs / 1000)}s without stdout`,
+        errorCode: "io_timeout",
+      });
+      runningProcesses.delete(run.id);
+
+      if (failed) {
+        await appendRunEvent(failed, await nextRunEventSeq(failed.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: `io_timeout: ${Math.round(silenceMs / 1000)}s without stdout (threshold: ${ioTimeoutSec}s)`,
+        });
+      }
+
+      if (sourceIssue) {
+        await issuesSvc.update(sourceIssue.id, { status: "blocked", assigneeAgentId: null });
+        await issuesSvc.addComment(
+          sourceIssue.id,
+          [
+            "## Subprocess I/O Timeout — Auto-Killed",
+            "",
+            `Paperclip detected no stdout output from the agent subprocess for **${Math.round(silenceMs / 1000)}s** (threshold: ${ioTimeoutSec}s). The subprocess was automatically killed.`,
+            "",
+            `- Run: \`${run.id}\``,
+            `- Agent: ${agentName ?? run.agentId}`,
+            `- Last output at: ${run.lastOutputAt ? new Date(run.lastOutputAt).toISOString() : "none recorded"}`,
+            `- Silence duration: ${Math.round(silenceMs / 1000)}s`,
+            "",
+            "Issue blocked for human review. Typical causes: network hang, SDK-level rate-limit stall, or socket block without exception.",
+          ].join("\n"),
+          {},
+        );
+      }
+
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "heartbeat.io_timeout_kill",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: {
+          source: "recovery.scan_io_timeout_runs",
+          silenceMs,
+          ioTimeoutSec,
+          lastOutputSeq: run.lastOutputSeq,
+          agentNameKey,
+          sourceIssueId: sourceIssue?.id ?? null,
+          sourceIssueStatus: sourceIssue?.status ?? null,
+        },
+      });
+
+      result.killed += 1;
+    }
+
+    return result;
+  }
+
   async function reconcileProductivityReviews(opts?: { now?: Date; companyId?: string }) {
     return productivityReviews.reconcileProductivityReviews(opts);
   }
@@ -7917,6 +8052,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileIssueGraphLiveness,
 
     scanSilentActiveRuns,
+
+    scanIoTimeoutRuns,
 
     reconcileProductivityReviews,
 
