@@ -58,7 +58,32 @@ For local adapters, set:
 - `cwd` (working directory)
 - `timeoutSec` (max runtime per heartbeat)
 - `graceSec` (time before force-kill after timeout/cancel)
+- `ioTimeoutSec` (max seconds of stdout silence before subprocess is auto-killed; see below)
 - optional env vars and extra CLI args
+
+### I/O timeout watchdog (`ioTimeoutSec`)
+
+The I/O timeout watchdog kills a subprocess that produces no stdout output for longer than `ioTimeoutSec` seconds. This catches silent hangs — network drops, SDK-level rate-limit stalls, or blocked `read()` calls that produce no error output — where the process-level `timeoutSec` does not fire (because the process is still alive).
+
+**Opt-in:** if `ioTimeoutSec` is absent or `0`, the watchdog skips that agent entirely.
+
+**Recommended defaults (as currently configured on the fleet):**
+
+| Agent | `ioTimeoutSec` | Rationale |
+|---|---|---|
+| Reviewer-Architecture | 600 (10 min) | Review turns are fast; 10 min silence is unambiguously hung |
+| Implementer-1 | 900 (15 min) | Code edits may require sustained tool calls; 15 min is generous |
+| Implementer-Architecture | 1200 (20 min) | Opus is slower on large tasks |
+
+**What happens on timeout:**
+
+1. Subprocess receives SIGTERM; SIGKILL follows after `graceSec` if still alive.
+2. The heartbeat run is marked `failed` with `errorCode: "io_timeout"`.
+3. The source issue is set to `blocked` and unassigned.
+4. An audit comment is posted on the issue with silence duration and threshold.
+5. A structured log line `{ event: "io_timeout_kill", ... }` is emitted for post-incident grep.
+
+**Note:** the watchdog is distinct from `stale_active_run_evaluation`, which fires after 1 hour and creates a meta-review issue rather than killing the subprocess directly. Both mechanisms coexist.
 
 ## 3.4 Prompt templates
 
