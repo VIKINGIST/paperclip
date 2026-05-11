@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -182,6 +182,8 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+const RETRY_BUDGET_WINDOW_MS = 30 * 60 * 1000;
+const RETRY_BUDGET_MAX_FAILS = 3;
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -3320,11 +3322,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function checkAndEnforceRetryBudget(
+    issueId: string,
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ): Promise<{ blocked: boolean }> {
+    const agentConfig = parseObject(agent.adapterConfig);
+    if (asBoolean(agentConfig.retryBudgetOptOut, false)) return { blocked: false };
+
+    const windowMs = asNumber(agentConfig.retryBudgetWindowMs, 0) || RETRY_BUDGET_WINDOW_MS;
+    const maxFails = asNumber(agentConfig.retryBudgetMaxFails, 0) || RETRY_BUDGET_MAX_FAILS;
+    const windowStart = new Date(now.getTime() - windowMs);
+
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, run.agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          eq(heartbeatRuns.status, "failed"),
+          gte(heartbeatRuns.finishedAt, windowStart),
+        ),
+      );
+
+    const recentFails = Number(count ?? 0);
+    if (recentFails < maxFails) return { blocked: false };
+
+    await issuesSvc.update(issueId, { status: "blocked", assigneeAgentId: null });
+    await issuesSvc.addComment(
+      issueId,
+      [
+        "## Auto-Blocked: Retry Budget Exceeded",
+        "",
+        `Paperclip detected **${recentFails} failed runs** for this issue in the last ${Math.round(windowMs / 60000)} minutes (limit: ${maxFails}).`,
+        "",
+        `- Last failed run: \`${run.id}\``,
+        `- Agent: ${agent.name ?? run.agentId}`,
+        `- Window: ${Math.round(windowMs / 60000)} min, limit: ${maxFails} fails`,
+        "",
+        "Likely cause: infrastructure issue (Postgres instability, network, subprocess crash). Unblock manually after root cause investigation.",
+      ].join("\n"),
+      {},
+    );
+    logger.warn({ issueId, recentFails, maxFails, windowMs, agentId: run.agentId, runId: run.id }, "retry_budget_exceeded");
+    return { blocked: true };
+  }
+
   async function enqueueMissingIssueCommentRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     issueId: string,
   ) {
+    const now = new Date();
+    const budgetResult = await checkAndEnforceRetryBudget(issueId, run, agent, now);
+    if (budgetResult.blocked) return null;
+
     const contextSnapshot = parseObject(run.contextSnapshot);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
@@ -3335,7 +3389,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryReason: "missing_issue_comment",
       missingIssueCommentForRunId: run.id,
     };
-    const now = new Date();
 
     const retryRun = await db.transaction(async (tx) => {
       await tx.execute(
@@ -3547,6 +3600,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+
+    if (issueId) {
+      const budgetResult = await checkAndEnforceRetryBudget(issueId, run, agent, now);
+      if (budgetResult.blocked) return null;
+    }
+
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = {
@@ -3697,6 +3756,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+
+    if (issueId) {
+      const budgetResult = await checkAndEnforceRetryBudget(issueId, run, agent, now);
+      if (budgetResult.blocked) return { outcome: "retry_budget_exceeded" as const, blocked: true };
+    }
+
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot: Record<string, unknown> = {
