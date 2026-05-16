@@ -5024,6 +5024,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       runningProcesses.delete(run.id);
 
+      // ELE-XXX (post-session-281 fix): io_timeout cleanup was leaving the
+      // agent in `status=running` ghost state. finalizeAgentStatus reconciles
+      // status based on remaining running-run count (→ idle/error). Matches
+      // the orphan-reaper pattern at line 4802 + cancellation at line 7780.
+      // Without this, AutoDispatcher's idle-agent gate blocks future routing
+      // and the only recovery was manual PATCH /api/agents/<id> {status: idle}.
+      // Pattern surfaced 4× across sessions 279+280 (Impl-1 + Impl-2 ghosts).
+      await finalizeAgentStatus(run.agentId, "timed_out");
+      await startNextQueuedRunForAgent(run.agentId);
+
       if (failed) {
         await appendRunEvent(failed, await nextRunEventSeq(failed.id), {
           eventType: "lifecycle",

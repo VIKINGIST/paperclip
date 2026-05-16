@@ -171,6 +171,37 @@ describeEmbeddedPostgres("subprocess io-timeout watchdog", () => {
     expect(events.some((e) => e.message?.includes("io_timeout"))).toBe(true);
   });
 
+  it("reconciles agent.status after io_timeout kill (post-session-281 ghost fix)", async () => {
+    // Bug: io_timeout cleanup was leaving agent.status='running' even though
+    // the run was failed and the issue was blocked. AutoDispatcher's idle-gate
+    // then skipped the agent forever — manual PATCH /api/agents/<id> {status:
+    // 'idle'} was the only recovery. Observed 4× across sessions 279+280.
+    //
+    // Fix: io_timeout cleanup now calls finalizeAgentStatus(agentId,
+    // 'timed_out'). With runningCount=0 and outcome=timed_out, the agent
+    // transitions running → error. Recover-ErrorAgents cron then flips
+    // error → idle. AutoDispatcher resumes routing without manual ops.
+    const now = new Date("2026-05-11T10:00:00.000Z");
+    const { companyId, agentId } = await seedRunningRun({
+      now,
+      lastOutputAgeMs: 700_000,
+      ioTimeoutSec: 600,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Pre-condition: agent is in `running` state (set by seedRunningRun).
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agentBefore?.status).toBe("running");
+
+    const result = await heartbeat.scanIoTimeoutRuns({ now, companyId });
+    expect(result.killed).toBe(1);
+
+    // Post-condition: agent flipped from `running` → `error` (no remaining
+    // running runs + outcome=timed_out).
+    const [agentAfter] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agentAfter?.status).toBe("error");
+  });
+
   it("skips run when source issue status is cancelled (ELE-110 pre-emptive fix)", async () => {
     const now = new Date("2026-05-11T10:00:00.000Z");
     const { companyId, runId } = await seedRunningRun({
